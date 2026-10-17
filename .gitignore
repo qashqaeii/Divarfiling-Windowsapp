@@ -21,6 +21,11 @@ extractor-app/release/installer-out/
 extractor-app/config/license.json
 extractor-app/config/app_data/settings.json
 extractor-app/config/app_data/*.log
+extractor-app/config/app_data/*.db
+
+# Local extraction output (sample runs)
+extractor-app/output/
+extractor-app/path_test.txt
 .env
 .env.*
 
