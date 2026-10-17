@@ -1,0 +1,31 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+*.egg-info/
+.venv/
+venv/
+
+# Build / release artifacts
+extractor-app/build/
+extractor-app/dist/
+extractor-app/release/app/
+extractor-app/release/installer-out/
+*.exe
+*.zip
+
+# Local config & secrets (never commit)
+extractor-app/config/license.json
+extractor-app/config/app_data/settings.json
+extractor-app/config/app_data/*.log
+.env
+.env.*
+
+# IDE / OS
+.idea/
+.vscode/
+Thumbs.db
+Desktop.ini

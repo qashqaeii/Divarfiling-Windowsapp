@@ -1,0 +1,26 @@
+{
+  "max_workers": 6,
+  "max_items": 100,
+  "output_format": "excel",
+  "download_images": false,
+  "appearance": "light",
+  "extraction": {
+    "upload_to_platform": true
+  },
+  "notifications": {
+    "enabled": true,
+    "sound": true,
+    "when_minimized_only": false,
+    "extraction": true,
+    "scheduler": true,
+    "license": true,
+    "errors": true,
+    "upload": true
+  },
+  "tray": {
+    "close_to_tray": true,
+    "show_close_hint": true,
+    "notify_extraction_complete": true,
+    "notify_errors": true
+  }
+}
