@@ -365,6 +365,13 @@ def _money_export_series(
     return pd.Series(values)
 
 
+def _assign_series_masked(excel_col: Any, values: Any, mask: Any) -> Any:
+    """انتساب مقادیر فقط وقتی mask حداقل یک True دارد (pandas 2.2+ روی float64)."""
+    if mask.any():
+        excel_col.loc[mask] = values.loc[mask]
+    return excel_col
+
+
 def _parse_slider_money(val: Any) -> Optional[int]:
     if val is None or val == "":
         return None
@@ -2764,7 +2771,7 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
                     source_col = source_col.apply(transform_func)
                 # پر کردن مقادیر خالی از ستون اصلی
                 mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
-                excel_col.loc[mask] = source_col.loc[mask]
+                excel_col = _assign_series_masked(excel_col, source_col, mask)
             return excel_col
         else:
             # اگر ستون اکسل وجود ندارد، از ستون اصلی استفاده می‌کنیم
@@ -3071,7 +3078,7 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
         filled = _money_export_series(
             df, get_col, "مالی_قیمت_کل_نمایش", "مالی_قیمت_کل_عدد", "مالی_قیمت_کل_وضعیت",
         )
-        excel_col.loc[mask] = filled.loc[mask]
+        excel_col = _assign_series_masked(excel_col, filled, mask)
         result_df["قیمت"] = excel_col
     else:
         result_df["قیمت"] = _money_export_series(
@@ -3085,7 +3092,7 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
         filled = _money_export_series(
             df, get_col, "مالی_قیمت_هر_متر_نمایش", "مالی_قیمت_هر_متر_عدد", "مالی_قیمت_هر_متر_وضعیت",
         )
-        excel_col.loc[mask] = filled.loc[mask]
+        excel_col = _assign_series_masked(excel_col, filled, mask)
         result_df["قیمت هر متر"] = excel_col
     else:
         result_df["قیمت هر متر"] = _money_export_series(
@@ -3462,7 +3469,7 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
                     source_col = source_col.apply(transform_func)
                 # پر کردن مقادیر خالی از ستون اصلی
                 mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
-                excel_col.loc[mask] = source_col.loc[mask]
+                excel_col = _assign_series_masked(excel_col, source_col, mask)
             return excel_col
         else:
             # اگر ستون اکسل وجود ندارد، از ستون اصلی استفاده می‌کنیم
@@ -3727,7 +3734,7 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
         filled = _money_export_series(
             df, get_col, "اجاره_ودیعه_نمایش", "اجاره_ودیعه_عدد", "اجاره_ودیعه_وضعیت",
         )
-        excel_col.loc[mask_empty] = filled.loc[mask_empty]
+        excel_col = _assign_series_masked(excel_col, filled, mask_empty)
         mask_to_process = ~mask_empty
         if mask_to_process.any():
             for idx in df.index[mask_to_process]:
@@ -3747,7 +3754,7 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
         filled = _money_export_series(
             df, get_col, "اجاره_ماهانه_نمایش", "اجاره_ماهانه_عدد", "اجاره_ماهانه_وضعیت",
         )
-        excel_col.loc[mask_empty] = filled.loc[mask_empty]
+        excel_col = _assign_series_masked(excel_col, filled, mask_empty)
         mask_to_process = ~mask_empty
         if mask_to_process.any():
             for idx in df.index[mask_to_process]:

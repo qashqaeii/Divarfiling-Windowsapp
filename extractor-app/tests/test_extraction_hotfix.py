@@ -53,6 +53,34 @@ class TestExportSell(unittest.TestCase):
             if os.path.exists(tmp):
                 os.remove(tmp)
 
+    def test_c_sell_export_prefilled_float_lat_lng(self):
+        """pandas 3.x: mask خالی روی ستون float64 (عرض/طول) نباید export را خراب کند."""
+        CONFIG["category"] = "apartment-sell"
+        rows = []
+        for i in range(50):
+            r = _sell_row(i)
+            lat = 36.65 + i * 0.001
+            r.update(
+                {
+                    "مکان_مختصات_lat": lat,
+                    "مکان_مختصات_lng": 51.42,
+                    "عرض جغرافیایی": lat,
+                    "طول جغرافیایی": 51.42,
+                    "قیمت": 5_000_000_000,
+                    "قیمت هر متر": 100_000_000,
+                }
+            )
+            rows.append(r)
+        tmp = tempfile.mktemp(suffix=".xlsx")
+        try:
+            path = export_to_excel(rows, tmp)
+            df = pd.read_excel(path)
+            self.assertEqual(len(df), 50)
+            self.assertTrue(df["عرض جغرافیایی"].notna().all())
+        finally:
+            if os.path.exists(tmp):
+                os.remove(tmp)
+
     def test_b_rent_then_sell_paths(self):
         engine = ExtractionEngine(
             MagicMock(),
