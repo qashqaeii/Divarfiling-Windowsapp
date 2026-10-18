@@ -11,11 +11,19 @@ DEFAULT_BACKOFF_SECONDS = (2.0, 5.0)
 
 
 class FatalOperationError(Exception):
-    """خطای غیرقابل retry — توقف batch."""
+    """خطای غیرقابل retry — توفف batch."""
 
     def __init__(self, message: str, *, category: str = "fatal") -> None:
         super().__init__(message)
         self.category = category
+
+
+class NonRetryableExtractionError(Exception):
+    """خطای قطعی استخراج/خروجی — تکرار کل فرایند شبکه مجاز نیست."""
+
+    def __init__(self, message: str, *, stage: str = "export") -> None:
+        super().__init__(message)
+        self.stage = stage
 
 
 FATAL_KEYWORDS = (

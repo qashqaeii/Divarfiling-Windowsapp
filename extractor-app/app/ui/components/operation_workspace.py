@@ -157,11 +157,12 @@ class OperationWorkspace(ctk.CTkFrame):
             lambda: self._on_open_folder and self._on_open_folder(),
             icon_key="folder", height=36, width=160,
         ).pack(side="right", padx=(SPACE_XS, 0))
-        OutlineButton(
+        self._platform_btn = OutlineButton(
             actions, "مشاهده در پلتفرم",
             lambda: self._on_open_platform and self._on_open_platform(),
             icon_key="upload", height=36, width=140,
-        ).pack(side="right", padx=(SPACE_XS, 0))
+        )
+        self._platform_btn.pack(side="right", padx=(SPACE_XS, 0))
         self._retry_btn = OutlineButton(
             actions, "تلاش مجدد موارد ناموفق",
             self._do_retry, icon_key="rocket", height=36, width=180,
@@ -275,12 +276,33 @@ class OperationWorkspace(ctk.CTkFrame):
             self.timeline.grid_remove()
             self._place_log_in_mid(batch=False)
 
-    def show_completed(self, summary: Optional[BatchRunSummary] = None, *, single_ok: bool = False) -> None:
+    def show_completed(
+        self,
+        summary: Optional[BatchRunSummary] = None,
+        *,
+        single_ok: bool = False,
+        outcome: str = "idle",
+        show_platform_link: bool = False,
+    ) -> None:
         self._state = "completed"
         self._idle.grid_forget()
         self._active.grid_forget()
         self._completed.grid(row=0, column=0, sticky="nsew")
-        self.op_status_badge.configure_text("پایان یافت", tone="success")
+        badge_tone = "success"
+        badge_text = "پایان یافت"
+        if outcome == "failed":
+            badge_tone = "error"
+            badge_text = "خطا"
+        elif outcome in ("no_results", "upload_failed"):
+            badge_tone = "warning"
+        elif outcome == "cancelled":
+            badge_tone = "muted"
+        self.op_status_badge.configure_text(badge_text, tone=badge_tone)
+        if hasattr(self, "_platform_btn"):
+            if show_platform_link:
+                self._platform_btn.pack(side="right", padx=(SPACE_XS, 0))
+            else:
+                self._platform_btn.pack_forget()
 
         for child in self._complete_list.winfo_children():
             child.destroy()
@@ -315,8 +337,26 @@ class OperationWorkspace(ctk.CTkFrame):
                 self._complete_list.pack_forget()
             except Exception:
                 pass
-            self._complete_title.configure(text="استخراج به پایان رسید" if single_ok else "عملیات پایان یافت")
-            self._complete_summary.configure(text="نتیجه در گزارش زنده و پوشه خروجی قابل مشاهده است.")
+            title_map = {
+                "success": "استخراج با موفقیت پایان یافت",
+                "upload_failed": "فایل خروجی ساخته شد — آپلود ناموفق",
+                "no_results": "آگهی منطبق با فیلتر یافت نشد",
+                "failed": "خطا در ساخت خروجی / استخراج",
+                "cancelled": "عملیات لغو شد",
+            }
+            self._complete_title.configure(
+                text=title_map.get(outcome, "استخراج به پایان رسید" if single_ok else "عملیات پایان یافت")
+            )
+            summary_map = {
+                "success": "نتیجه در گزارش زنده و پوشه خروجی قابل مشاهده است.",
+                "upload_failed": "فایل محلی ذخیره شده است؛ آپلود به پلتفرم انجام نشد.",
+                "no_results": "پس از فیلترها آگهی‌ای برای export باقی نماند.",
+                "failed": "جزئیات در گزارش زنده و فایل لاگ محلی ثبت شده است.",
+                "cancelled": "می‌توانید دوباره استخراج را آغاز کنید.",
+            }
+            self._complete_summary.configure(
+                text=summary_map.get(outcome, "نتیجه در گزارش زنده و پوشه خروجی قابل مشاهده است.")
+            )
             self._retry_btn.pack_forget()
             self._retry_jobs = []
             self._place_log_in_completed()

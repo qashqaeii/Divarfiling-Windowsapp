@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import time
+import traceback
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any, Callable, Dict, List, Optional, Set
 from urllib.parse import urlparse
@@ -13,6 +14,7 @@ import pandas as pd
 from app.constants import FILE_PREFIX_BY_TRANSACTION, MAX_EXTRACTION_ITEMS
 from app.paths import get_output_dir, sanitize_path_segment
 from app.places import PlacesManager
+from app.retry_utils import NonRetryableExtractionError
 from app.storage import ExtractorStorage
 
 
@@ -163,6 +165,22 @@ class ExtractionEngine:
         else:
             file_name = f"{prefix}{ext}"
         return os.path.join(*path_parts, file_name)
+
+    def _resolve_output_path(self, settings: Dict[str, Any], configured_path: str) -> str:
+        """مسیر خروجی هم‌تراز با تنظیمات فعلی job (جلوگیری از فایل اجارهٔ قبلی در استخراج فروش)."""
+        expected = self.build_output_path(settings)
+        if not configured_path:
+            return expected
+        if not str(configured_path).lower().endswith(self.output_extension(settings).lower()):
+            return expected
+        try:
+            if os.path.normcase(os.path.normpath(configured_path)) != os.path.normcase(
+                os.path.normpath(expected)
+            ):
+                return expected
+        except (TypeError, ValueError, OSError):
+            return expected
+        return configured_path
 
     def merge_excel_files(self, new_rows: List[Dict[str, Any]], excel_path: str) -> List[Dict[str, Any]]:
         if not os.path.exists(excel_path):
@@ -458,15 +476,11 @@ class ExtractionEngine:
             return None
 
         output_format = settings.get("output_format", "excel")
-        expected_ext = self.output_extension(settings)
-        excel_output_path = self.scraper.CONFIG.get("excel_output", output_path)
-        if not str(excel_output_path).lower().endswith(expected_ext):
-            excel_output_path = self.build_output_path(settings)
-            self.scraper.CONFIG["excel_output"] = excel_output_path
-        base_path = os.path.splitext(excel_output_path)[0]
+        out_path = self._resolve_output_path(settings, output_path)
+        self.scraper.CONFIG["excel_output"] = out_path
+        base_path = os.path.splitext(out_path)[0]
 
         if output_format == "excel":
-            out_path = excel_output_path
             if os.path.exists(out_path):
                 self.on_log("✓ فایل موجود شناسایی شد. در حال ادغام...", "info")
                 rows = self.merge_excel_files(rows, out_path)
@@ -499,25 +513,51 @@ class ExtractionEngine:
                 "warning",
             )
 
-        if output_format == "excel":
-            self.on_log("در حال ساخت/به‌روزرسانی فایل اکسل...", "info")
-            final_path = self.scraper.export_to_excel(filtered_rows, out_path)
-            self.on_log(f"✓ فایل اکسل با موفقیت ایجاد/به‌روزرسانی شد: {final_path}", "success")
-        elif output_format == "csv":
-            out_path = base_path + ".csv"
-            self.on_log("در حال ساخت فایل CSV...", "info")
-            final_path = self.scraper.export_to_csv(filtered_rows, out_path)
-            self.on_log(f"✓ فایل CSV با موفقیت ایجاد شد: {final_path}", "success")
-        elif output_format == "json":
-            out_path = base_path + ".json"
-            self.on_log("در حال ساخت فایل JSON...", "info")
-            final_path = self.scraper.export_to_json(filtered_rows, out_path)
-            self.on_log(f"✓ فایل JSON با موفقیت ایجاد شد: {final_path}", "success")
-        else:
-            out_path = excel_output_path
-            self.on_log("در حال ساخت/به‌روزرسانی فایل اکسل...", "info")
-            final_path = self.scraper.export_to_excel(filtered_rows, out_path)
-            self.on_log(f"✓ فایل اکسل با موفقیت ایجاد/به‌روزرسانی شد: {final_path}", "success")
+        if not filtered_rows:
+            self.on_log("آگهی منطبق با فیلتر یافت نشد.", "warning")
+            return None
+
+        export_stage = "export"
+        try:
+            if output_format == "excel":
+                export_stage = "excel"
+                self.on_log("در حال ساخت/به‌روزرسانی فایل اکسل...", "info")
+                final_path = self.scraper.export_to_excel(filtered_rows, out_path)
+                self.on_log(f"✓ فایل اکسل با موفقیت ایجاد/به‌روزرسانی شد: {final_path}", "success")
+            elif output_format == "csv":
+                export_stage = "csv"
+                csv_path = base_path + ".csv"
+                self.on_log("در حال ساخت فایل CSV...", "info")
+                final_path = self.scraper.export_to_csv(filtered_rows, csv_path)
+                self.on_log(f"✓ فایل CSV با موفقیت ایجاد شد: {final_path}", "success")
+            elif output_format == "json":
+                export_stage = "json"
+                json_path = base_path + ".json"
+                self.on_log("در حال ساخت فایل JSON...", "info")
+                final_path = self.scraper.export_to_json(filtered_rows, json_path)
+                self.on_log(f"✓ فایل JSON با موفقیت ایجاد شد: {final_path}", "success")
+            else:
+                export_stage = "excel"
+                self.on_log("در حال ساخت/به‌روزرسانی فایل اکسل...", "info")
+                final_path = self.scraper.export_to_excel(filtered_rows, out_path)
+                self.on_log(f"✓ فایل اکسل با موفقیت ایجاد/به‌روزرسانی شد: {final_path}", "success")
+        except Exception as exc:
+            self.on_log(f"✗ خطا در ساخت خروجی ({export_stage}): {exc}", "error")
+            self.storage.append_log(
+                f"EXPORT ERR stage={export_stage} path={out_path} "
+                f"rows={len(filtered_rows)} err={type(exc).__name__}: {exc}\n"
+                f"{traceback.format_exc()}"
+            )
+            raise NonRetryableExtractionError(
+                f"ساخت فایل خروجی ناموفق: {exc}",
+                stage=export_stage,
+            ) from exc
+
+        if not final_path or not os.path.isfile(final_path):
+            msg = f"فایل خروجی پس از export وجود ندارد: {final_path or out_path}"
+            self.on_log(f"✗ {msg}", "error")
+            self.storage.append_log(f"EXPORT MISSING: {msg}")
+            raise NonRetryableExtractionError(msg, stage=export_stage)
 
         if settings.get("download_images"):
             self.download_all_images(filtered_rows, final_path, session)

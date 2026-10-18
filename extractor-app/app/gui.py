@@ -164,6 +164,8 @@ class ExtractorApp(ctk.CTk):
         self._run_is_scheduled = False
         self._run_had_output = False
         self._run_cancelled = False
+        self._run_outcome = "idle"
+        self._run_show_platform = False
         self._last_scrape_error = ""
         self._pending_output_path: Optional[str] = None
         self._last_run_stats: Dict[str, int] = {"total": 0, "done": 0, "ok": 0}
@@ -299,6 +301,8 @@ class ExtractorApp(ctk.CTk):
         self._run_is_scheduled = scheduled
         self._run_had_output = False
         self._run_cancelled = False
+        self._run_outcome = "idle"
+        self._run_show_platform = False
         self._last_scrape_error = ""
         self._pending_output_path = None
         self._last_run_stats = {"total": 0, "done": 0, "ok": 0}
@@ -2959,21 +2963,45 @@ class ExtractorApp(ctk.CTk):
             subcategory=sub,
             api_slug=api,
         )
+        upload_requested = bool(job_settings.get("upload_to_platform"))
+        if result.extraction_status == JobStatus.CANCELLED:
+            self._run_outcome = "cancelled"
+            return
+
         if result.output_path:
+            self._run_had_output = True
             self._last_output_path = result.output_path
             self._queue.put(("__OUTPUT__:" + result.output_path, "success"))
             if result.upload_status == UploadStatus.SUCCESS:
+                self._run_outcome = "success"
+                self._run_show_platform = upload_requested
                 self._notifier.upload_success(
                     dataset_name="",
                     added_count=int(result.extracted_count or 0),
                 )
             elif result.upload_status == UploadStatus.FAILED:
-                self._notifier.upload_failed(result.error_message or "آپلود ناموفق")
-        elif result.extraction_status == JobStatus.CANCELLED:
-            pass
-        elif result.extraction_status in (JobStatus.FAILED, JobStatus.NO_RESULTS):
-            if result.error_message:
-                self._last_scrape_error = result.error_message
+                self._run_outcome = "upload_failed"
+                self._run_show_platform = False
+                err = result.error_message or "آپلود ناموفق"
+                self._last_scrape_error = err
+                self._emit_threadsafe(
+                    f"⚠ فایل خروجی ساخته شد؛ آپلود ناموفق: {err}",
+                    "warning",
+                )
+                self._notifier.upload_failed(err)
+            else:
+                self._run_outcome = "success"
+                self._run_show_platform = False
+        elif result.extraction_status == JobStatus.NO_RESULTS:
+            self._run_outcome = "no_results"
+            msg = result.error_message or "آگهی منطبق با فیلتر یافت نشد."
+            self._last_scrape_error = msg
+            self._emit_threadsafe(msg, "warning")
+        elif result.extraction_status == JobStatus.FAILED:
+            self._run_outcome = "failed"
+            msg = result.error_message or "استخراج ناموفق"
+            self._last_scrape_error = msg
+            self._emit_threadsafe(f"✗ {msg}", "error")
 
     def _start(self) -> None:
         if not self._require_valid_license():
@@ -3211,7 +3239,29 @@ class ExtractorApp(ctk.CTk):
                             pass
                     try:
                         self._set_extraction_ui_idle()
-                        self._set_status_message("آماده", tone="success")
+                        outcome = getattr(self, "_run_outcome", "idle")
+                        if was_batch:
+                            status_tone = "success"
+                            status_text = "آماده"
+                        elif self._run_cancelled or outcome == "cancelled":
+                            status_tone = "warning"
+                            status_text = "عملیات لغو شد"
+                        elif outcome == "success":
+                            status_tone = "success"
+                            status_text = "استخراج موفق"
+                        elif outcome == "upload_failed":
+                            status_tone = "warning"
+                            status_text = "خروجی ساخته شد — آپلود ناموفق"
+                        elif outcome == "no_results":
+                            status_tone = "warning"
+                            status_text = "بدون نتیجه"
+                        elif outcome == "failed":
+                            status_tone = "error"
+                            status_text = "خطای استخراج"
+                        else:
+                            status_tone = "muted"
+                            status_text = "آماده"
+                        self._set_status_message(status_text, tone=status_tone)
                         if self.scrape_start_time:
                             elapsed = time.time() - self.scrape_start_time
                             mins, secs = divmod(int(elapsed), 60)
@@ -3219,9 +3269,22 @@ class ExtractorApp(ctk.CTk):
                                 text=f"مدت کل: {fa_digits(mins)}:{fa_digits(f'{secs:02d}')}"
                             )
                             if hasattr(self, "current_task_lbl") and not was_batch:
-                                self.current_task_lbl.configure(text="استخراج با موفقیت پایان یافت")
+                                task_labels = {
+                                    "success": "استخراج با موفقیت پایان یافت",
+                                    "upload_failed": "فایل ساخته شد — آپلود ناموفق",
+                                    "no_results": "آگهی منطبق با فیلتر یافت نشد",
+                                    "failed": "استخراج ناموفق",
+                                    "cancelled": "عملیات لغو شد",
+                                }
+                                self.current_task_lbl.configure(
+                                    text=task_labels.get(outcome, "عملیات پایان یافت")
+                                )
                         if hasattr(self, "_workspace") and not was_batch:
-                            self._workspace.show_completed(single_ok=not self._run_cancelled)
+                            self._workspace.show_completed(
+                                single_ok=(outcome == "success"),
+                                outcome=outcome,
+                                show_platform_link=bool(self._run_show_platform),
+                            )
                     except Exception as exc:
                         self._storage.append_log(f"DONE UI ERR: {exc}")
                     self._sync_tray_status()

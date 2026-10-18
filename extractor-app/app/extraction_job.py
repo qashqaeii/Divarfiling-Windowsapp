@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import copy
+import traceback
+import uuid
 from typing import Any, Callable, Dict, Optional
 
 from app.batch_models import BatchJobResult, JobStatus, UploadStatus, utc_now_iso
@@ -9,7 +11,12 @@ from app.extraction_engine import ExtractionEngine
 from app.license_client import LicenseClient
 from app.platform_upload import upload_extraction_file_with_retry
 from app.places import PlacesManager
-from app.retry_utils import FatalOperationError, is_fatal_error_message, run_with_retry
+from app.retry_utils import (
+    FatalOperationError,
+    NonRetryableExtractionError,
+    is_fatal_error_message,
+    run_with_retry,
+)
 
 LogFn = Callable[[str, str], None]
 CancelFn = Callable[[], bool]
@@ -56,12 +63,14 @@ class ExtractionJobService:
             result.finished_at = utc_now_iso()
             return result
 
+        job_id = uuid.uuid4().hex[:8]
         try:
-            output_path = self._run_extraction_with_retry(settings)
+            output_path = self._run_extraction_with_retry(settings, job_id=job_id)
         except FatalOperationError as exc:
             result.extraction_status = JobStatus.FAILED
             result.error_message = str(exc)
             result.finished_at = utc_now_iso()
+            self._log_extraction_failure(job_id, exc, stage="fatal")
             raise
         except Exception as exc:
             if self.is_cancelled():
@@ -70,6 +79,7 @@ class ExtractionJobService:
             else:
                 result.extraction_status = JobStatus.FAILED
                 result.error_message = str(exc)
+                self._log_extraction_failure(job_id, exc, stage=getattr(exc, "stage", "extract"))
             result.finished_at = utc_now_iso()
             return result
 
@@ -111,7 +121,19 @@ class ExtractionJobService:
         result.finished_at = utc_now_iso()
         return result
 
-    def _run_extraction_with_retry(self, settings: Dict[str, Any]) -> Optional[str]:
+    def _log_extraction_failure(self, job_id: str, exc: Exception, *, stage: str) -> None:
+        self.on_log(
+            f"✗ [job {job_id}] شکست استخراج ({stage}): {type(exc).__name__}: {exc}",
+            "error",
+        )
+        self.engine.storage.append_log(
+            f"EXTRACT FAIL job={job_id} stage={stage} "
+            f"err={type(exc).__name__}: {exc}\n{traceback.format_exc()}"
+        )
+
+    def _run_extraction_with_retry(
+        self, settings: Dict[str, Any], *, job_id: str
+    ) -> Optional[str]:
         def _attempt() -> Optional[str]:
             if self.is_cancelled():
                 return None
@@ -119,15 +141,19 @@ class ExtractionJobService:
 
         def _on_retry(attempt: int, exc: Exception) -> None:
             self.on_log(
-                f"⚠ خطای موقت استخراج — تلاش {attempt + 1}/۳: {exc}",
+                f"⚠ [job {job_id} تلاش {attempt + 1}/۳] خطای موقت شبکه/استخراج: {exc}",
                 "warning",
+            )
+            self.engine.storage.append_log(
+                f"RETRY job={job_id} attempt={attempt + 1} err={type(exc).__name__}: {exc}"
             )
 
         def _retryable(exc: Exception) -> bool:
-            if isinstance(exc, FatalOperationError):
+            if isinstance(exc, (FatalOperationError, NonRetryableExtractionError)):
                 return False
             return not is_fatal_error_message(str(exc))
 
+        self.on_log(f"[job {job_id}] شروع استخراج (حداکثر ۳ تلاش برای خطای موقت)", "info")
         return run_with_retry(
             _attempt,
             on_retry=_on_retry,
