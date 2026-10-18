@@ -481,8 +481,8 @@ class ExtractionEngine:
         filtered_rows, removed_ads = self.scraper._filter_roommate_ads(rows, return_removed=True)
         if removed_ads:
             self.on_log(f"⚠ {len(removed_ads)} آگهی همخانه/خوابگاه/پانسیون شناسایی و حذف شد:", "warning")
-            for ad_title, reason in removed_ads:
-                self.on_log(f"  ✗ حذف شد ({reason}): {ad_title}", "warning")
+            for ad_title in removed_ads:
+                self.on_log(f"  ✗ حذف شد: {ad_title}", "warning")
 
         advertiser_filter = (settings.get("filters") or {}).get("advertiser_filter", "all")
         filtered_rows, removed_consultant = self.scraper._filter_by_advertiser_type(
