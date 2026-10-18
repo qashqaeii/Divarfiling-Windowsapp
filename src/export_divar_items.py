@@ -96,80 +96,6 @@ def to_english_digits(text: str) -> str:
     return text.translate(trans_map)
 
 
-def normalize_floor_value(val: Any) -> str:
-    """تبدیل مقدار طبقه به عدد: 2، 3 از 5 -> 3، همکف -> 0، زیر همکف -> -1."""
-    if val is None:
-        return "-"
-    if isinstance(val, float) and math.isnan(val):
-        return "-"
-    if isinstance(val, (int, float)):
-        return str(int(val))
-
-    val_str = str(val).strip()
-    if not val_str or val_str == "-":
-        return "-"
-
-    val_norm = to_english_digits(val_str)
-    compact = val_norm.replace("\u200c", "").replace(" ", "").lower()
-
-    if "زیرهمکف" in compact or ("زیر" in val_norm and "همکف" in val_norm):
-        return "-1"
-    if compact == "همکف" or (val_str.strip() == "همکف"):
-        return "0"
-    if "همکف" in val_str and "زیر" not in val_str and not re.search(r"\d", val_norm):
-        return "0"
-
-    numbers = re.findall(r"\d+", val_norm)
-    if numbers:
-        return str(int(numbers[0]))
-
-    return "-"
-
-
-def _extract_attribute_series(
-    df: Any,
-    attr_key: str,
-    default: str = "-",
-    transform: Optional[Any] = None,
-) -> Any:
-    """ستون ویژگی (مثل ساخت/اتاق/طبقه) از ستون مستقیم یا attributes."""
-    import pandas as pd
-
-    def _from_attributes(raw: Any) -> str:
-        val = default
-        try:
-            parts = [p.strip() for p in str(raw).split("|") if p.strip()]
-            for part in parts:
-                if ":" in part:
-                    key, value = part.split(":", 1)
-                    if key.strip() == attr_key:
-                        val = value.strip()
-                        break
-        except Exception:
-            pass
-        return val
-
-    if attr_key in df.columns:
-        series = df[attr_key].copy()
-        if "attributes" in df.columns:
-            mask = series.isna() | (series == "") | (series == "-")
-            if mask.any():
-                for idx in df.index[mask]:
-                    raw_attrs = df.loc[idx, "attributes"]
-                    if pd.notna(raw_attrs) and str(raw_attrs).strip():
-                        val = _from_attributes(raw_attrs)
-                        if val != default:
-                            series.iloc[idx] = val
-    elif "attributes" in df.columns:
-        series = pd.Series([_from_attributes(raw) for raw in df["attributes"].fillna("")], index=df.index)
-    else:
-        series = pd.Series([default] * len(df), index=df.index)
-
-    if transform:
-        series = series.apply(transform)
-    return series
-
-
 def parse_money_to_int(text: str) -> Optional[int]:
     if not text:
         return None
@@ -198,6 +124,676 @@ def parse_money_to_int(text: str) -> Optional[int]:
     if 'هزار' in tl or 'thousand' in tl:
         return amount * 1_000
     return amount
+
+
+_TOTAL_PRICE_TITLES = frozenset({"قیمت کل", "قیمت کل ملک"})
+_RENT_CONVERT_NON_PATTERN = re.compile(r"غیر\s*قابل\s*تبدیل|غیرقابل\s*تبدیل")
+_JALALI_MONTH_BY_NAME = {
+    "فروردین": 1,
+    "اردیبهشت": 2,
+    "خرداد": 3,
+    "تیر": 4,
+    "مرداد": 5,
+    "شهریور": 6,
+    "مهر": 7,
+    "آبان": 8,
+    "آذر": 9,
+    "دی": 10,
+    "بهمن": 11,
+    "اسفند": 12,
+}
+_TEXTUAL_PRICE_LABELS = frozenset({"توافقی", "متعارف", "رایگان", "رهن کامل"})
+_MONEY_STATUS_LABELS = {
+    "free": "رایگان",
+    "negotiable": "توافقی",
+    "customary": "متعارف",
+    "full_deposit": "رهن کامل",
+}
+_AREA_UNIT_SUFFIX_RE = re.compile(
+    r"[\s\u200c\u200f\u200e]*(متر\s*مربع|مترمربع|متر\s*زمین|متر)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def parse_area_sqm(text: Any) -> Optional[float]:
+    """استخراج متراژ به متر مربع از متن نمایشی دیوار."""
+    if text is None:
+        return None
+    val_str = str(text).strip()
+    if not val_str or val_str in ("-", "—", "Unknown", "unknown", "nan", "None"):
+        return None
+    val_str = to_english_digits(val_str)
+    val_str = re.sub(r"[\s\u200c\u200f\u200e]+", " ", val_str).strip()
+    val_str = _AREA_UNIT_SUFFIX_RE.sub("", val_str).strip()
+    val_str = val_str.replace("٬", "").replace(",", "").replace("،", "").replace(" ", "")
+    if not val_str:
+        return None
+    if not re.fullmatch(r"\d+\.?\d*", val_str):
+        match = re.search(r"(\d+(?:\.\d+)?)", val_str)
+        if not match:
+            return None
+        val_str = match.group(1)
+    try:
+        num = float(val_str)
+    except ValueError:
+        return None
+    if num <= 0:
+        return None
+    return num
+
+
+def format_metraj_export(val: Any) -> str:
+    """خروجی ستون متراژ — «-» یعنی نامشخص (نه صفر)."""
+    if val is None:
+        return "-"
+    try:
+        import pandas as pd
+        if pd.isna(val):
+            return "-"
+    except Exception:
+        pass
+    parsed = parse_area_sqm(val)
+    if parsed is None:
+        s = str(val).strip()
+        return "-" if not s or s == "-" else "-"
+    if parsed == int(parsed):
+        return str(int(parsed))
+    return str(parsed)
+
+
+def _normalize_money_status_label(text: str) -> str:
+    s = str(text or "").strip().replace("\u200c", "")
+    if not s:
+        return ""
+    if "رایگان" in s:
+        return "رایگان"
+    if "توافقی" in s:
+        return "توافقی"
+    if "متعارف" in s:
+        return "متعارف"
+    if "رهن" in s and "کامل" in s:
+        return "رهن کامل"
+    return s if s in _TEXTUAL_PRICE_LABELS else ""
+
+
+def parse_divar_money_display(text: Any) -> Dict[str, Any]:
+    """
+    تفکیک مبلغ عددی، صفر، وضعیت متنی و نامشخص.
+    amount: int شامل صفر، یا None
+    status: numeric | zero | free | negotiable | customary | full_deposit | unknown
+    """
+    display = str(text or "").strip()
+    if not display or display in ("-", "—", "nan", "None"):
+        return {"amount": None, "status": "unknown", "label": "", "display": display}
+
+    label = _normalize_money_status_label(display)
+    if label == "رایگان":
+        return {"amount": None, "status": "free", "label": "رایگان", "display": display}
+    if label == "توافقی":
+        return {"amount": None, "status": "negotiable", "label": "توافقی", "display": display}
+    if label == "متعارف":
+        return {"amount": None, "status": "customary", "label": "متعارف", "display": display}
+    if label == "رهن کامل":
+        return {"amount": None, "status": "full_deposit", "label": "رهن کامل", "display": display}
+
+    amount = parse_money_to_int(display)
+    if amount is not None:
+        if amount == 0:
+            return {"amount": 0, "status": "zero", "label": "۰", "display": display}
+        return {"amount": amount, "status": "numeric", "label": "", "display": display}
+    return {"amount": None, "status": "unknown", "label": "", "display": display}
+
+
+def _is_textual_price(value: str) -> bool:
+    return parse_divar_money_display(value).get("status") in (
+        "free",
+        "negotiable",
+        "customary",
+        "full_deposit",
+    )
+
+
+def _money_status_from_label(label: str) -> str:
+    for status, text in _MONEY_STATUS_LABELS.items():
+        if label == text:
+            return status
+    return "unknown"
+
+
+def format_money_export_value(money: Dict[str, Any]) -> Any:
+    """خروجی ستون مالی اکسل/CSV/JSON."""
+    status = money.get("status") or "unknown"
+    if status in _MONEY_STATUS_LABELS:
+        return _MONEY_STATUS_LABELS[status]
+    if status == "zero":
+        return 0
+    amount = money.get("amount")
+    if status == "numeric" and amount is not None:
+        return amount
+    return "-"
+
+
+def _merge_money_parsed(display: str, amount_val: Any, status_label: str = "") -> Dict[str, Any]:
+    if status_label:
+        return {
+            "amount": None,
+            "status": _money_status_from_label(status_label),
+            "label": status_label,
+            "display": display or status_label,
+        }
+    money = parse_divar_money_display(display)
+    if money.get("status") != "unknown":
+        return money
+    if amount_val is not None and not (isinstance(amount_val, float) and math.isnan(amount_val)):
+        try:
+            import pandas as pd
+            if pd.isna(amount_val):
+                return money
+        except Exception:
+            pass
+        try:
+            num = int(amount_val)
+            if num == 0:
+                return {"amount": 0, "status": "zero", "label": "۰", "display": display}
+            return {"amount": num, "status": "numeric", "label": "", "display": display}
+        except (TypeError, ValueError):
+            pass
+    return money
+
+
+def _resolve_money_amount(
+    money: Dict[str, Any],
+    webengage_val: Any,
+    *,
+    explicit_display: bool,
+) -> Optional[int]:
+    if money.get("amount") is not None:
+        return money.get("amount")
+    if explicit_display and money.get("status") not in ("unknown",):
+        return None
+    if isinstance(webengage_val, int):
+        return webengage_val
+    return None
+
+
+def _resolve_total_price_num(
+    display: str,
+    parsed: Optional[int],
+    webengage: Dict[str, Any],
+    *,
+    explicit_display: bool = True,
+) -> Optional[int]:
+    money = _merge_money_parsed(display, parsed)
+    return _resolve_money_amount(money, webengage.get("price"), explicit_display=explicit_display)
+
+
+def _money_export_series(
+    df: Any,
+    get_col,
+    display_key: str,
+    num_key: str,
+    status_key: str,
+) -> Any:
+    """ساخت ستون مالی نهایی از نمایش/عدد/وضعیت."""
+    import pandas as pd
+
+    values: List[Any] = []
+    for idx in range(len(df)):
+        status_label = ""
+        label_key = status_key.replace("_وضعیت", "_برچسب")
+        if label_key in df.columns:
+            raw_label = get_col(label_key).iloc[idx]
+            if not pd.isna(raw_label) and str(raw_label).strip():
+                status_label = str(raw_label).strip()
+        if not status_label and status_key in df.columns:
+            raw_status = get_col(status_key).iloc[idx]
+            if not pd.isna(raw_status):
+                st = str(raw_status).strip()
+                status_label = _MONEY_STATUS_LABELS.get(st, st if st in _TEXTUAL_PRICE_LABELS else "")
+        display = ""
+        if display_key in df.columns:
+            raw_display = get_col(display_key).iloc[idx]
+            if not pd.isna(raw_display):
+                display = str(raw_display).strip()
+        amount_val = None
+        if num_key in df.columns:
+            raw_num = get_col(num_key).iloc[idx]
+            if not pd.isna(raw_num):
+                amount_val = raw_num
+        money = _merge_money_parsed(display, amount_val, status_label)
+        values.append(format_money_export_value(money))
+    return pd.Series(values)
+
+
+def _parse_slider_money(val: Any) -> Optional[int]:
+    if val is None or val == "":
+        return None
+    if isinstance(val, bool):
+        return None
+    if isinstance(val, int):
+        return val
+    if isinstance(val, float):
+        try:
+            return int(val)
+        except (ValueError, OverflowError):
+            return None
+    return parse_money_to_int(str(val))
+
+
+def _rent_convertibility_from_feature_title(fr_title: str) -> str:
+    t = str(fr_title or "").strip()
+    if not t:
+        return ""
+    if _RENT_CONVERT_NON_PATTERN.search(t):
+        return "غیر قابل تبدیل"
+    if "قابل تبدیل" in t:
+        return "قابل تبدیل"
+    return ""
+
+
+def _strip_schedule_prefix(text: str) -> str:
+    t = str(text or "").strip()
+    for label in (
+        "انتشار",
+        "تاریخ انتشار",
+        "آخرین نردبان",
+        "آخرین به‌روزرسانی",
+        "بروزرسانی",
+    ):
+        if t.startswith(label):
+            rest = t[len(label):].strip()
+            if rest.startswith(":") or rest.startswith("："):
+                return rest[1:].strip()
+            return rest
+    return t
+
+
+def parse_divar_schedule_label(text: str) -> Optional[str]:
+    """تبدیل «۲۱ شهریور ۱۴۰۵، ۱۳:۳۴» به 1405/06/21 13:34."""
+    raw = _strip_schedule_prefix(text)
+    t = to_english_digits(raw).replace("،", ",").strip()
+    t = t.replace("‌", " ").replace("\u200c", " ")
+    match = re.search(r"(\d{1,2})\s+(\S+)\s+(\d{4})", t)
+    if not match:
+        return None
+    day = int(match.group(1))
+    month_name = match.group(2).strip()
+    year = int(match.group(3))
+    month = _JALALI_MONTH_BY_NAME.get(month_name)
+    if not month or not (1300 <= year <= 1500) or not (1 <= day <= 31):
+        return None
+    time_match = re.search(r"(\d{1,2}):(\d{2})", t)
+    if time_match:
+        hour = int(time_match.group(1))
+        minute = int(time_match.group(2))
+        return f"{year}/{month:02d}/{day:02d} {hour:02d}:{minute:02d}"
+    return f"{year}/{month:02d}/{day:02d} 00:00"
+
+
+def _format_shamsi_export_datetime(value: str) -> str:
+    """خروجی یکنواخت شمسی با دقت دقیقه (بدون ثانیهٔ ساختگی)."""
+    s = str(value or "").strip()
+    if not s or s in ("-", "—"):
+        return ""
+    if len(s) >= 19 and s[4] == "/" and s[13] == ":" and s[16] == ":":
+        return s[:16]
+    return s
+
+
+def _classify_schedule_line(line: str) -> Optional[str]:
+    t = str(line or "").strip()
+    if not t:
+        return None
+    if t.startswith("انتشار") or "انتشار آگهی" in t[:24]:
+        return "published"
+    if "نردبان" in t:
+        return "last_bumped"
+    if "به‌روز" in t or "بروز" in t:
+        return "last_updated"
+    return None
+
+
+def _extract_publish_schedule_from_detail(sections: List[Dict[str, Any]]) -> Dict[str, str]:
+    out = {"published": "", "last_bumped": "", "last_updated": ""}
+    for sec in sections or []:
+        if sec.get("section_name") != "TITLE":
+            continue
+        for w in sec.get("widgets") or []:
+            widget_lists: List[List[Dict[str, Any]]] = []
+            if w.get("widget_type") == "EXPANDABLE_SECTION":
+                widget_lists.append(safe_get(w, ["data", "widget_list"]) or [])
+            elif w.get("widget_type") == "DESCRIPTION_ROW":
+                widget_lists.append([w])
+            for wl in widget_lists:
+                for iw in wl:
+                    if iw.get("widget_type") != "DESCRIPTION_ROW":
+                        continue
+                    text = str(safe_get(iw, ["data", "text"]) or "").strip()
+                    if not text:
+                        continue
+                    lines = text.splitlines() if "\n" in text else [text]
+                    for line in lines:
+                        kind = _classify_schedule_line(line)
+                        if not kind:
+                            continue
+                        parsed = parse_divar_schedule_label(line)
+                        if parsed:
+                            out[kind] = _format_shamsi_export_datetime(parsed)
+    return out
+
+
+def _publish_shamsi_from_flat_fields(row: Dict[str, Any]) -> Optional[str]:
+    for key in ("انتشار_تاریخ_شمسی", "created_at"):
+        val = row.get(key)
+        if val is None:
+            continue
+        s = str(val).strip()
+        if s and s not in ("-", "—", "nan", "None"):
+            return s
+    return None
+
+
+def _series_created_shamsi_from_df(df: Any, get_col) -> List[str]:
+    """تاریخ انتشار — فقط از منبع واقعی دیوار؛ بدون انقضا منهای ۳۰ روز."""
+    import pandas as pd
+
+    publish_col = get_col("انتشار_تاریخ_شمسی") if "انتشار_تاریخ_شمسی" in df.columns else None
+    created_dates: List[str] = []
+    for idx in range(len(df)):
+        if publish_col is not None:
+            pv = publish_col.iloc[idx]
+            if not pd.isna(pv) and str(pv).strip() not in ("", "-"):
+                created_dates.append(_format_shamsi_export_datetime(str(pv).strip()) or "-")
+                continue
+        created_dates.append("-")
+    return created_dates
+
+
+def _apply_created_shamsi_column(df: Any, get_col, result_df: Any, column_name: str = "ایجاد آگهی") -> None:
+    """ستون ایجاد آگهی/تاریخ انتشار — بدون ساخت تاریخ از unavailable_after."""
+    import pandas as pd
+
+    if column_name in df.columns:
+        excel_col = get_col(column_name).copy()
+    else:
+        excel_col = pd.Series(["-"] * len(df), index=df.index)
+
+    publish_col = get_col("انتشار_تاریخ_شمسی") if "انتشار_تاریخ_شمسی" in df.columns else None
+    if publish_col is not None:
+        for idx in range(len(df)):
+            pv = publish_col.iloc[idx]
+            if pd.isna(pv) or str(pv).strip() in ("", "-"):
+                continue
+            formatted = _format_shamsi_export_datetime(str(pv).strip())
+            if formatted:
+                excel_col.iloc[idx] = formatted
+
+    result_df[column_name] = excel_col.apply(
+        lambda x: "-" if (pd.isna(x) or str(x).strip() in ("", "-")) else _format_shamsi_export_datetime(str(x).strip()) or str(x).strip()
+    )
+
+
+def _optional_schedule_columns_from_df(df: Any, get_col, result_df: Any) -> None:
+    """ستون‌های اختیاری زمان‌بندی در خروجی اکسل."""
+    import pandas as pd
+
+    mapping = (
+        ("انتشار_تاریخ_شمسی", "تاریخ انتشار"),
+        ("انتشار_آخرین_نردبان_شمسی", "آخرین نردبان"),
+        ("انتشار_آخرین_به‌روزرسانی_شمسی", "آخرین به‌روزرسانی"),
+    )
+    for source_key, excel_col in mapping:
+        if source_key not in df.columns:
+            continue
+        col = get_col(source_key)
+        values = []
+        for val in col:
+            if pd.isna(val) or str(val).strip() in ("", "-"):
+                values.append("-")
+            else:
+                values.append(str(val).strip())
+        result_df[excel_col] = pd.Series(values)
+
+
+# ستون‌های مشترک فروش/اجاره — معنای یکسان، بدون ستون‌های مالی اختصاصی
+SHARED_EXPORT_EXCEL_COLUMNS = (
+    "دسته‌بندی",
+    "آدرس",
+    "اصالت تصویر",
+    "تصویر نقشه",
+)
+
+SHARED_SCHEDULE_EXPORT_COLUMNS = (
+    "ایجاد آگهی",
+    "تاریخ انتشار",
+    "آخرین نردبان",
+    "آخرین به‌روزرسانی",
+    "انقضا آگهی",
+)
+
+_FLATTEN_PASSTHROUGH_PREFIXES = (
+    "دسته‌بندی_",
+    "مکان_",
+    "نقشه_",
+    "رسانه_",
+    "مشاور_",
+    "فروشنده_",
+    "انتشار_",
+    "اجاره_",
+    "مالی_",
+    "ویژگی_",
+)
+
+_FLATTEN_PASSTHROUGH_BLOCKED_PREFIXES = (
+    "تماس_",
+    "سیستمی_",
+)
+
+_FLATTEN_PASSTHROUGH_BLOCKED_EXACT = frozenset({
+    "phone_text",
+    "owner_phone",
+    "تماس_contact_uuid",
+    "تماس_چت_فعال",
+    "تماس_تماس_ایمن",
+})
+
+_FLATTEN_PASSTHROUGH_EXACT = frozenset({
+    "token",
+    "title",
+    "description",
+    "attributes",
+    "share_link",
+    "price_text",
+    "rent_convertibility",
+    "ویژگی_ها_و_امکانات",
+})
+
+
+def _append_shared_listing_export_columns(
+    result_df: Any,
+    df: Any,
+    get_col,
+    combine_excel_and_source,
+) -> None:
+    """ستون‌های پایه مشترک بین مسیر فروش و اجاره."""
+    result_df["دسته‌بندی"] = combine_excel_and_source("دسته‌بندی", "دسته‌بندی_عنوان")
+    result_df["آدرس"] = combine_excel_and_source("آدرس", "مکان_آدرس", "-")
+    result_df["اصالت تصویر"] = combine_excel_and_source(
+        "اصالت تصویر",
+        "رسانه_اصالت_تصویر_برای_همین_ملک",
+    )
+    result_df["تصویر نقشه"] = combine_excel_and_source("تصویر نقشه", "نقشه_تصویر")
+
+
+def _flatten_passthrough_payload(raw: Dict[str, Any]) -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for key, val in (raw or {}).items():
+        if val is None or str(val).strip() in ("", "-"):
+            continue
+        key_s = str(key)
+        if key_s in _FLATTEN_PASSTHROUGH_BLOCKED_EXACT or any(
+            key_s.startswith(prefix) for prefix in _FLATTEN_PASSTHROUGH_BLOCKED_PREFIXES
+        ):
+            continue
+        if key_s in _FLATTEN_PASSTHROUGH_EXACT or any(
+            key_s.startswith(prefix) for prefix in _FLATTEN_PASSTHROUGH_PREFIXES
+        ):
+            out[key_s] = val
+    return out
+
+
+_IMAGE_ORIGINALITY_TITLES = frozenset({
+    "تصویر‌ها برای همین ملک است؟",
+    "تصویرها برای همین ملک است؟",
+    "تصاویر برای همین ملک است؟",
+})
+
+
+def _parse_image_originality_answer(value: Any) -> Dict[str, str]:
+    """پاسخ آگهی‌دهنده به اصالت تصویر — بدون تأیید مستقل صحت عکس."""
+    raw = str(value or "").strip()
+    if not raw or raw in ("-", "—"):
+        return {"raw": "", "status": "unknown", "export_label": ""}
+    norm = raw.replace("\u200c", "").strip().lower()
+    if norm in ("بله", "yes", "true", "آری"):
+        return {"raw": raw, "status": "yes", "export_label": "بله"}
+    if norm in ("خیر", "no", "false"):
+        return {"raw": raw, "status": "no", "export_label": "خیر"}
+    return {"raw": raw, "status": "unknown", "export_label": raw}
+
+
+def _extract_image_carousel_tooltip_text(detail: Dict[str, Any]) -> str:
+    for section in detail.get("sections", []) or []:
+        if section.get("section_name") != "IMAGE":
+            continue
+        for widget in section.get("widgets", []) or []:
+            if str(widget.get("widget_type") or "") != "IMAGE_CAROUSEL":
+                continue
+            data = widget.get("data") or {}
+            tooltip = data.get("tooltip_data") or {}
+            text = str(tooltip.get("text") or "").strip()
+            if text:
+                return text
+    return ""
+
+
+def _parse_decorative_image_tooltip(text: str) -> Dict[str, Any]:
+    """برچسب Tooltip کاروسل — فقط «تزئینی» صریح؛ اعداد معنی ندارند."""
+    raw = str(text or "").strip()
+    if not raw:
+        return {"raw": "", "decorative": None}
+    digits_only = re.sub(r"\s+", "", raw)
+    if digits_only.isdigit() or re.fullmatch(r"[\d۰-۹]+", digits_only):
+        return {"raw": raw, "decorative": None}
+    if "تزئین" in raw.replace("\u200c", ""):
+        return {"raw": raw, "decorative": True}
+    return {"raw": raw, "decorative": None}
+
+
+def _export_label_for_image_originality(parsed: Dict[str, str]) -> str:
+    label = parsed.get("export_label") or ""
+    if label in ("بله", "خیر"):
+        return label
+    return label if label else "-"
+
+
+def _export_label_for_decorative(decorative: Optional[bool]) -> str:
+    if decorative is True:
+        return "تزئینی"
+    if decorative is False:
+        return "خیر"
+    return "-"
+
+
+def _parse_geo_coordinate(value: Any) -> Optional[float]:
+    if value is None or value == "":
+        return None
+    try:
+        num = float(str(value).strip().replace(",", ""))
+    except (TypeError, ValueError):
+        return None
+    if math.isnan(num) or math.isinf(num):
+        return None
+    return num
+
+
+def _normalize_lat_lng_pair(lat: Optional[float], lng: Optional[float]) -> tuple:
+    if lat is None or lng is None:
+        return lat, lng
+    if not (-90 <= lat <= 90 and -180 <= lng <= 180):
+        return None, None
+    if 44 <= lat <= 63 and 25 <= lng <= 40:
+        return lng, lat
+    return lat, lng
+
+
+def _extract_map_fields_from_sections(sections: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """استخراج مختصات و نوع موقعیت — EXACT و FUZZY جدا و بدون شعاع ساختگی."""
+    out: Dict[str, Any] = {
+        "latitude": "",
+        "longitude": "",
+        "مکان_مختصات_lat": "",
+        "مکان_مختصات_lng": "",
+        "نقشه_نوع": "",
+        "نقشه_شعاع_محدوده_متر": "",
+        "نقشه_تصویر": "",
+        "مکان_مختصات_اعتبار": "missing",
+    }
+    for sec in sections or []:
+        if sec.get("section_name") != "MAP":
+            continue
+        for w in sec.get("widgets", []) or []:
+            if w.get("widget_type") != "MAP_ROW":
+                continue
+            loc = safe_get(w, ["data", "location"]) or {}
+            loc_type = str(loc.get("type") or "").strip().upper()
+            point: Dict[str, Any] = {}
+            radius_val: Any = ""
+            if loc_type == "EXACT":
+                point = safe_get(loc, ["exact_data", "point"]) or {}
+            elif loc_type == "FUZZY":
+                point = safe_get(loc, ["fuzzy_data", "point"]) or {}
+                radius_val = safe_get(loc, ["fuzzy_data", "radius"])
+            elif safe_get(loc, ["exact_data", "point"]):
+                point = safe_get(loc, ["exact_data", "point"]) or {}
+                loc_type = "EXACT"
+            elif safe_get(loc, ["fuzzy_data", "point"]):
+                point = safe_get(loc, ["fuzzy_data", "point"]) or {}
+                loc_type = "FUZZY"
+                radius_val = safe_get(loc, ["fuzzy_data", "radius"])
+            lat = _parse_geo_coordinate(point.get("latitude"))
+            lng = _parse_geo_coordinate(point.get("longitude"))
+            lat, lng = _normalize_lat_lng_pair(lat, lng)
+            if lat is not None and lng is not None:
+                out["latitude"] = str(lat)
+                out["longitude"] = str(lng)
+                out["مکان_مختصات_lat"] = str(lat)
+                out["مکان_مختصات_lng"] = str(lng)
+                out["مکان_مختصات_اعتبار"] = "valid"
+            elif point:
+                out["مکان_مختصات_اعتبار"] = "invalid"
+            out["نقشه_نوع"] = loc_type
+            if radius_val not in (None, ""):
+                parsed_radius = _parse_geo_coordinate(radius_val)
+                if parsed_radius is not None and parsed_radius > 0:
+                    out["نقشه_شعاع_محدوده_متر"] = str(int(parsed_radius))
+            out["نقشه_تصویر"] = safe_get(w, ["data", "image_url"]) or ""
+            return out
+    return out
+
+
+def _merge_flatten_passthrough_into_records(
+    records: List[Dict[str, Any]],
+    rows: List[Dict[str, Any]],
+) -> None:
+    """فیلدهای flatten که در اکسل نیستند — برای Import/Listing.data حفظ شوند."""
+    for i, raw in enumerate(rows):
+        if i >= len(records):
+            break
+        for key, val in _flatten_passthrough_payload(raw).items():
+            if key in records[i] and records[i][key] not in (None, "", "-"):
+                continue
+            records[i][key] = val
 
 
 GEO_COORD_EXCEL_COLUMNS = ("عرض جغرافیایی", "طول جغرافیایی")
@@ -566,6 +1162,12 @@ FEATURE_EXCEL_COLUMNS = [
     "نمای ساختمان",
     "وضعیت سند",
     "وضعیت سکونت",
+    "کاربری ملک",
+    "موقعیت ملک",
+    "جهت ملک",
+    "بنای کلنگی",
+    "دسترسی به انشعابات",
+    "عرض گذر",
 ]
 
 _FEATURE_ROW_PREFIXES = (
@@ -575,6 +1177,48 @@ _FEATURE_ROW_PREFIXES = (
     "تأمین‌کننده آب گرم ",
     "سرویس بهداشتی ",
 )
+
+_SPEC_FIELD_TITLES = frozenset({"متراژ", "اتاق", "طبقه", "ساخت", "سال ساخت"})
+
+
+def _assign_spec_field(out: Dict[str, Any], title: str, value: str) -> None:
+    """نگاشت مستقیم فیلدهای اصلی ملک از LIST_DATA به کلیدهای export."""
+    t = str(title or "").strip()
+    v = str(value or "").strip()
+    if not t or not v:
+        return
+    key = "ساخت" if t == "سال ساخت" else t
+    if key in _SPEC_FIELD_TITLES or key in ("متراژ", "اتاق", "طبقه", "ساخت"):
+        if key == "متراژ":
+            formatted = format_metraj_export(v)
+            out[key] = formatted if formatted != "-" else v
+        else:
+            out[key] = v
+
+
+def _parse_subtitle_specs(text: str) -> Dict[str, str]:
+    """استخراج متراژ/اتاق/طبقه از زیرعنوان آگهی (مثلاً «۴۹ متر · ۱ اتاق · طبقه ۳»)."""
+    if not text:
+        return {}
+    t = str(text).translate(str.maketrans("۰۱۲۳۴۵۶۷۸۹", "0123456789"))
+    specs: Dict[str, str] = {}
+    m = re.search(r"(\d+)\s*متر", t)
+    if m:
+        specs["متراژ"] = m.group(1)
+    if "بدون اتاق" in text or "بدون اتاق" in t:
+        specs["اتاق"] = "بدون اتاق"
+    else:
+        m = re.search(r"(\d+)\s*اتاق", t)
+        if m:
+            specs["اتاق"] = m.group(1)
+    m = re.search(r"طبقه\s*(\d+)", t)
+    if m:
+        specs["طبقه"] = m.group(1)
+    m = re.search(r"(\d+)\s*از\s*(\d+)", t)
+    if m:
+        specs["طبقه"] = m.group(1)
+        specs["تعداد کل طبقات ساختمان"] = m.group(2)
+    return specs
 
 
 def _normalize_feature_row_title(title: str) -> tuple:
@@ -674,6 +1318,43 @@ def _extract_modal_features_from_action(action: Optional[Dict[str, Any]]) -> Dic
     return _parse_feature_widget_list(safe_get(modal_page, ["widget_list"]) or [])
 
 
+_LIST_DATA_UNEXPANDABLE_SKIP_TITLES = frozenset({
+    *_TOTAL_PRICE_TITLES,
+    "قیمت هر متر",
+    "متراژ",
+    "ودیعه",
+    "بیعانه",
+    "رهن",
+    "رهن کامل",
+    "اجارهٔ ماهانه",
+    "اجاره ماهانه",
+    "ودیعه و اجاره",
+    "رهن و اجاره",
+    *_IMAGE_ORIGINALITY_TITLES,
+})
+
+
+def _extract_list_data_unexpandable_features(sections: List[Dict[str, Any]]) -> Dict[str, str]:
+    """ویژگی‌های UNEXPANDABLE_ROW در LIST_DATA (غیرقیمت/غیرمشخصات اصلی)."""
+    features: Dict[str, str] = {}
+    for sec in sections or []:
+        if sec.get("section_name") != "LIST_DATA":
+            continue
+        for w in sec.get("widgets", []) or []:
+            if w.get("widget_type") != "UNEXPANDABLE_ROW":
+                continue
+            title = str(safe_get(w, ["data", "title"]) or "").strip()
+            value = str(safe_get(w, ["data", "value"]) or "").strip()
+            if not title or not value:
+                continue
+            if title in _LIST_DATA_UNEXPANDABLE_SKIP_TITLES:
+                continue
+            if title in _SPEC_FIELD_TITLES or title == "سال ساخت":
+                continue
+            features[title] = value
+    return features
+
+
 def _default_business_lazy_body(token: str) -> Dict[str, Any]:
     return {
         "request_data": {
@@ -681,6 +1362,32 @@ def _default_business_lazy_body(token: str) -> Dict[str, Any]:
             "post_token": token,
         }
     }
+
+
+_BUSINESS_LAZY_REST_PATH_RE = re.compile(
+    r"^/v8/premium-user/post-page/business-data/([A-Za-z0-9_-]+)/lazy$"
+)
+
+
+def _normalize_business_lazy_rest_path(path: str, expected_token: str) -> Optional[str]:
+    """فقط endpoint مجاز lazy پنل تجاری — بدون دامنه یا مسیر غیرمنتظره."""
+    raw = str(path or "").strip()
+    if not raw:
+        return None
+    if raw.startswith("https://api.divar.ir"):
+        raw = raw[len("https://api.divar.ir"):]
+    elif raw.startswith("http://api.divar.ir"):
+        raw = raw[len("http://api.divar.ir"):]
+    if not raw.startswith("/"):
+        return None
+    match = _BUSINESS_LAZY_REST_PATH_RE.match(raw)
+    if not match:
+        return None
+    path_token = match.group(1)
+    token = str(expected_token or "").strip()
+    if token and path_token != token:
+        return None
+    return raw
 
 
 def _find_business_lazy_request(detail: Dict[str, Any]) -> Optional[tuple]:
@@ -693,15 +1400,16 @@ def _find_business_lazy_request(detail: Dict[str, Any]) -> Optional[tuple]:
                 continue
             data = w.get("data") or {}
             path = str(data.get("rest_request_path") or "").strip()
-            if not path:
+            post_token = str(safe_get(detail, ["webengage", "token"]) or "").strip()
+            normalized = _normalize_business_lazy_rest_path(path, post_token)
+            if not normalized:
                 continue
             req_data = data.get("request_data") or {}
             if req_data:
                 body: Dict[str, Any] = {"request_data": req_data}
             else:
-                post_token = str(safe_get(detail, ["webengage", "token"]) or "").strip()
                 body = _default_business_lazy_body(post_token)
-            return path, body
+            return normalized, body
     return None
 
 
@@ -711,35 +1419,62 @@ def fetch_business_lazy_widgets(
     session: Optional[requests.Session] = None,
 ) -> List[Dict[str, Any]]:
     """دریافت widget_list مشاور/آژانس از API lazy (POST)."""
+    token = str(token or safe_get(detail, ["webengage", "token"]) or "").strip()
     found = _find_business_lazy_request(detail)
     if found:
         path, body = found
     else:
         business_type = str(safe_get(detail, ["webengage", "business_type"]) or "").strip().lower()
-        if business_type != "premium-panel":
+        if business_type not in ("premium-panel", "premium_panel"):
             return []
         path = f"/v8/premium-user/post-page/business-data/{token}/lazy"
         body = _default_business_lazy_body(token)
 
+    normalized = _normalize_business_lazy_rest_path(path, token)
+    if not normalized:
+        return []
+
     if not body.get("request_data"):
         body = _default_business_lazy_body(token)
 
-    url = path if path.startswith("http") else f"https://api.divar.ir{path}"
-    resp = request_with_retry(
-        "POST",
-        url,
-        headers=LIST_HEADERS,
-        json_body=body,
-        timeout=CONFIG["timeout_sec"],
-        session=session,
-    )
+    url = f"https://api.divar.ir{normalized}"
+    try:
+        resp = request_with_retry(
+            "POST",
+            url,
+            headers=LIST_HEADERS,
+            json_body=body,
+            timeout=CONFIG["timeout_sec"],
+            session=session,
+        )
+    except Exception:
+        return []
     if resp is None or resp.status_code != 200:
         return []
     try:
         payload = resp.json()
     except json.JSONDecodeError:
         return []
-    return payload.get("widget_list") or []
+    if not isinstance(payload, dict):
+        return []
+    widgets = payload.get("widget_list")
+    if not isinstance(widgets, list):
+        return []
+    return widgets
+
+
+def _normalize_consultant_active_ads_subtitle(subtitle: str) -> str:
+    """زیرعنوان آگهی‌های فعال — اعداد تنها (مثل image_count) معتبر نیستند."""
+    s = str(subtitle or "").strip()
+    if not s:
+        return ""
+    compact = re.sub(r"[\s\u200c\u200f\u200e]+", "", s)
+    compact = to_english_digits(compact).replace(",", "").replace("٬", "")
+    if compact.isdigit():
+        return ""
+    if "آگهی" not in s and "فعال" not in s:
+        return ""
+    return s
 
 
 def _extract_consultant_from_widget_list(widget_list: List[Dict[str, Any]]) -> Dict[str, str]:
@@ -749,15 +1484,24 @@ def _extract_consultant_from_widget_list(widget_list: List[Dict[str, Any]]) -> D
         "مشاور_آگهی_فعال": "",
     }
     for w in widget_list or []:
+        if not isinstance(w, dict):
+            continue
         if w.get("widget_type") != "EVENT_ROW":
             continue
         data = w.get("data") or {}
+        if not isinstance(data, dict):
+            continue
         action = data.get("action") or {}
         if action.get("type") != "PREMIUM_PANEL_BRAND_LANDING":
             continue
-        result["مشاور_نام"] = str(data.get("title") or "").strip()
-        result["مشاور_آگهی_فعال"] = str(data.get("subtitle") or "").strip()
-        break
+        name = str(data.get("title") or "").strip()
+        if name:
+            result["مشاور_نام"] = name
+        active = _normalize_consultant_active_ads_subtitle(str(data.get("subtitle") or ""))
+        if active:
+            result["مشاور_آگهی_فعال"] = active
+        if result["مشاور_نام"]:
+            break
     return result
 
 
@@ -883,10 +1627,7 @@ def _apply_search_filters(form_data: Dict[str, Any]) -> None:
         if key in supported and _truthy_filter_flag(sf.get(key)):
             form_data[key] = {"boolean": {"value": True}}
 
-    from advertiser_signal import normalize_filter_value
-
-    advertiser_filter = normalize_filter_value(sf.get("advertiser_filter") or "all")
-    # شخصی و مالک واقعی: پیش‌فیلتر API دیوار برای کاهش حجم واکشی
+    advertiser_filter = str(sf.get("advertiser_filter") or "all").strip().lower()
     if advertiser_filter in ("personal", "genuine_personal"):
         form_data["business-type"] = {"repeated_string": {"value": ["personal"]}}
 
@@ -1234,6 +1975,8 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     out["title"] = final_title
     out["عنوان"] = final_title
     out["زیرعنوان"] = subtitle_text
+    for key, val in _parse_subtitle_specs(subtitle_text).items():
+        out.setdefault(key, val)
 
     # توضیحات
     description_text = ""
@@ -1297,10 +2040,11 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
                             v = str(it.get("value") or "").strip()
                             if t or v:
                                 attrs_list.append(f"{t}:{v}")
+                                _assign_spec_field(out, t, v)
                 elif wtype == "UNEXPANDABLE_ROW":
                     title = str(safe_get(w, ["data", "title"]) or "").strip()
                     value = str(safe_get(w, ["data", "value"]) or "").strip()
-                    if title == "قیمت کل":
+                    if title in _TOTAL_PRICE_TITLES:
                         total_price = value
                         total_price_num = parse_money_to_int(value)
                     elif title == "قیمت هر متر":
@@ -1315,57 +2059,94 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
                     elif title in ("ودیعه و اجاره", "رهن و اجاره"):
                         rent_convertibility = value
                     elif title or value:
-                        attrs_list.append(f"{title}:{value}")
+                        attr_val = value
+                        if title.strip() == "متراژ":
+                            formatted = format_metraj_export(value)
+                            if formatted != "-":
+                                attr_val = formatted
+                        attrs_list.append(f"{title}:{attr_val}")
+                        _assign_spec_field(out, title, value)
                 elif wtype == "FEATURE_ROW":
                     # برخی آگهی‌ها فقط یک متن دربارهٔ قابلیت تبدیل دارند
                     # فقط اگر rent_convertibility قبلاً تنظیم نشده باشد
                     if not rent_convertibility:
                         fr_title = str(safe_get(w, ["data", "title"]) or "").strip()
-                        if fr_title:
-                            # بررسی "قابل تبدیل"
-                            if "قابل تبدیل" in fr_title:
-                                rent_convertibility = "قابل تبدیل"
-                            # بررسی "غیر قابل تبدیل" (برای اطمینان)
-                            elif "غیر قابل تبدیل" in fr_title or "غیرقابل تبدیل" in fr_title:
-                                rent_convertibility = "غیر قابل تبدیل"
+                        conv = _rent_convertibility_from_feature_title(fr_title)
+                        if conv:
+                            rent_convertibility = conv
                 elif wtype == "RENT_SLIDER":
                     # RENT_SLIDER نشان‌دهنده قابل تبدیل بودن است
                     has_rent_slider = True
-                    c_val = safe_get(w, ["data", "credit", "value"]) or ""
-                    c_tr = safe_get(w, ["data", "credit", "transformed_value"]) or ""
-                    r_val = safe_get(w, ["data", "rent", "value"]) or ""
-                    r_tr = safe_get(w, ["data", "rent", "transformed_value"]) or ""
-                    slider_credit_value = parse_money_to_int(str(c_val))
-                    slider_credit_transformed = parse_money_to_int(str(c_tr))
-                    slider_rent_value = parse_money_to_int(str(r_val))
-                    slider_rent_transformed = parse_money_to_int(str(r_tr))
+                    c_val = safe_get(w, ["data", "credit", "value"])
+                    c_tr = safe_get(w, ["data", "credit", "transformed_value"])
+                    r_val = safe_get(w, ["data", "rent", "value"])
+                    r_tr = safe_get(w, ["data", "rent", "transformed_value"])
+                    slider_credit_value = _parse_slider_money(c_val)
+                    slider_credit_transformed = _parse_slider_money(c_tr)
+                    slider_rent_value = _parse_slider_money(r_val)
+                    slider_rent_transformed = _parse_slider_money(r_tr)
+    if out.get("متراژ"):
+        area_num = parse_area_sqm(out.get("متراژ"))
+        if area_num is not None:
+            out["متراژ_عدد"] = area_num
+    total_money = _merge_money_parsed(total_price, total_price_num)
     out["price_text"] = total_price
     out["مالی_قیمت_کل_نمایش"] = total_price
-    out["مالی_قیمت_کل_عدد"] = total_price_num if total_price_num is not None else webengage.get("price")
+    out["مالی_قیمت_کل_وضعیت"] = total_money.get("status") or "unknown"
+    if total_money.get("label"):
+        out["مالی_قیمت_کل_برچسب"] = total_money["label"]
+    out["مالی_قیمت_کل_عدد"] = _resolve_money_amount(
+        total_money,
+        webengage.get("price"),
+        explicit_display=bool(str(total_price or "").strip()),
+    )
+    ppm_money = _merge_money_parsed(price_per_meter, price_per_meter_num)
     if price_per_meter:
         attrs_list.append(f"قیمت هر متر:{price_per_meter}")
     out["مالی_قیمت_هر_متر_نمایش"] = price_per_meter
-    out["مالی_قیمت_هر_متر_عدد"] = price_per_meter_num
+    out["مالی_قیمت_هر_متر_وضعیت"] = ppm_money.get("status") or "unknown"
+    if ppm_money.get("label"):
+        out["مالی_قیمت_هر_متر_برچسب"] = ppm_money["label"]
+    out["مالی_قیمت_هر_متر_عدد"] = ppm_money.get("amount") if ppm_money.get("status") in ("numeric", "zero") else (
+        None if ppm_money.get("status") not in ("unknown",) else price_per_meter_num
+    )
     out["مالی_ارز"] = "تومان" if (total_price or price_per_meter) else ""
     out["مالی_منبع_قیمت_وب‌انگیج"] = webengage.get("price")
 
-    # اجاره
-    # تکمیل از RENT_SLIDER در صورت نبود دادهٔ صریح
-    if deposit_num is None:
-        # ابتدا transformed سپس value
-        deposit_num = slider_credit_transformed if slider_credit_transformed is not None else slider_credit_value
-    if rent_monthly_num is None:
-        rent_monthly_num = slider_rent_transformed if slider_rent_transformed is not None else slider_rent_value
-    # تکمیل از webengage در صورت نبود
-    if deposit_num is None:
-        deposit_num = webengage.get("credit") if isinstance(webengage.get("credit"), int) else None
-    if rent_monthly_num is None:
-        rent_monthly_num = webengage.get("rent") if isinstance(webengage.get("rent"), int) else None
+    # اجاره — وضعیت متنی بر webengage/slider اولویت دارد
+    def _finalize_rent_component(display_text: str, parsed_num: Optional[int], slider_num: Optional[int], webengage_num: Any) -> tuple:
+        explicit = bool(str(display_text or "").strip())
+        money = parse_divar_money_display(display_text) if explicit else _merge_money_parsed("", parsed_num)
+        if money.get("status") in ("free", "negotiable", "customary", "full_deposit"):
+            return money, None
+        if money.get("amount") is not None:
+            return money, money["amount"]
+        if not explicit:
+            if slider_num is not None:
+                return {"amount": slider_num, "status": "numeric", "label": "", "display": display_text}, slider_num
+            if isinstance(webengage_num, int):
+                return {"amount": webengage_num, "status": "numeric", "label": "", "display": display_text}, webengage_num
+        return money, None
+
+    dep_money, deposit_resolved = _finalize_rent_component(
+        deposit_text, deposit_num, slider_credit_value, webengage.get("credit"),
+    )
+    rent_money, rent_resolved = _finalize_rent_component(
+        rent_monthly_text, rent_monthly_num, slider_rent_value, webengage.get("rent"),
+    )
 
     out["اجاره_ودیعه_نمایش"] = deposit_text
-    out["اجاره_ودیعه_عدد"] = deposit_num
+    out["اجاره_ودیعه_وضعیت"] = dep_money.get("status") or "unknown"
+    if dep_money.get("label"):
+        out["اجاره_ودیعه_برچسب"] = dep_money["label"]
+    out["اجاره_ودیعه_عدد"] = deposit_resolved
+    out["اجاره_ودیعه_تبدیل_عدد"] = slider_credit_transformed
     out["اجاره_ماهانه_نمایش"] = rent_monthly_text
-    out["اجاره_ماهانه_عدد"] = rent_monthly_num
+    out["اجاره_ماهانه_وضعیت"] = rent_money.get("status") or "unknown"
+    if rent_money.get("label"):
+        out["اجاره_ماهانه_برچسب"] = rent_money["label"]
+    out["اجاره_ماهانه_عدد"] = rent_resolved
+    out["اجاره_ماهانه_تبدیل_عدد"] = slider_rent_transformed
 
     if rent_convertibility:
         out["اجاره_قابل_تبدیل"] = rent_convertibility
@@ -1376,6 +2157,7 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
 
     # ویژگی‌ها و امکانات (صفحه اصلی + مودال LOAD_MODAL_PAGE)
     features_kv: Dict[str, str] = {}
+    _merge_feature_kv(features_kv, _extract_list_data_unexpandable_features(sections))
     features_titles: List[str] = []
     for s in sections:
         if s.get("section_name") != "LIST_DATA":
@@ -1408,34 +2190,8 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     features_titles = _apply_features_to_out(out, features_kv)
 
     # مختصات و نقشه
-    lat = ""
-    lon = ""
-    map_type = ""
-    map_radius = ""
-    map_image = ""
-    for s in sections:
-        if s.get("section_name") == "MAP":
-            for w in s.get("widgets", []) or []:
-                if w.get("widget_type") == "MAP_ROW":
-                    lat = str(
-                        safe_get(w, ["data", "location", "exact_data", "point", "latitude"]) or
-                        safe_get(w, ["data", "location", "fuzzy_data", "point", "latitude"]) or ""
-                    )
-                    lon = str(
-                        safe_get(w, ["data", "location", "exact_data", "point", "longitude"]) or
-                        safe_get(w, ["data", "location", "fuzzy_data", "point", "longitude"]) or ""
-                    )
-                    map_type = safe_get(w, ["data", "location", "type"]) or ""
-                    map_radius = str(safe_get(w, ["data", "location", "fuzzy_data", "radius"]) or "")
-                    map_image = safe_get(w, ["data", "image_url"]) or ""
-                    break
-    out["latitude"] = lat
-    out["longitude"] = lon
-    out["مکان_مختصات_lat"] = lat
-    out["مکان_مختصات_lng"] = lon
-    out["نقشه_نوع"] = map_type
-    out["نقشه_شعاع_محدوده_متر"] = map_radius
-    out["نقشه_تصویر"] = map_image
+    map_fields = _extract_map_fields_from_sections(sections)
+    out.update(map_fields)
 
     # تصاویر و ویدیو
     image_urls = _extract_image_urls_from_detail(detail)
@@ -1458,17 +2214,29 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     out["لینک تصاویر"] = joined_images
     out["رسانه_تعداد_تصویر"] = len(image_urls) if image_urls else ""
     out["رسانه_ویدیو"] = video_url
-    # اصالت تصویر
-    image_originality = ""
+    out["رسانه_ویدیو_دارد"] = "1" if video_url else ""
+    tooltip_text = _extract_image_carousel_tooltip_text(detail)
+    decorative = _parse_decorative_image_tooltip(tooltip_text)
+    out["رسانه_برچسب_تصاویر_tooltip"] = decorative.get("raw") or ""
+    if decorative.get("decorative") is True:
+        out["رسانه_تصاویر_تزئینی"] = "بله"
+    # اصالت تصویر (اظهار آگهی‌دهنده)
+    image_originality_raw = ""
     for s in sections:
-        if s.get("section_name") == "LIST_DATA":
-            for w in s.get("widgets", []) or []:
-                if w.get("widget_type") == "UNEXPANDABLE_ROW":
-                    title = str(safe_get(w, ["data", "title"]) or "")
-                    if title.strip() == "تصویر‌ها برای همین ملک است؟":
-                        image_originality = str(safe_get(w, ["data", "value"]) or "")
-                        break
-    out["رسانه_اصالت_تصویر_برای_همین_ملک"] = image_originality
+        if s.get("section_name") != "LIST_DATA":
+            continue
+        for w in s.get("widgets", []) or []:
+            if w.get("widget_type") != "UNEXPANDABLE_ROW":
+                continue
+            title = str(safe_get(w, ["data", "title"]) or "").strip().replace("\u200c", "")
+            if title in _IMAGE_ORIGINALITY_TITLES:
+                image_originality_raw = str(safe_get(w, ["data", "value"]) or "")
+                break
+        if image_originality_raw:
+            break
+    originality = _parse_image_originality_answer(image_originality_raw)
+    out["رسانه_اصالت_تصویر_برای_همین_ملک"] = originality.get("raw") or image_originality_raw
+    out["رسانه_اصالت_تصویر_وضعیت"] = originality.get("status") or "unknown"
 
     # لینک اشتراک
     out["share_link"] = safe_get(share, ["web_url"]) or ""
@@ -1481,10 +2249,13 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     out["فروشنده_تخفیف"] = "جزئی" if "تخفیف" in (description_text or "") else ""
 
     # مشاور / آژانس املاک (از API lazy: business-data/.../lazy)
-    business_widgets = detail.get("business_lazy_widget_list") or detail.get("widget_list") or []
+    business_widgets = detail.get("business_lazy_widget_list")
+    if not isinstance(business_widgets, list):
+        business_widgets = []
     consultant = _extract_consultant_from_widget_list(business_widgets)
     out.update(consultant)
-    out["مشاور_business_ref"] = webengage.get("business_ref") or ""
+    business_ref = str(webengage.get("business_ref") or "").strip()
+    out["مشاور_business_ref"] = business_ref
 
     # آدرس (از توضیحات اگر یافت شود)
     address = "، ".join([p for p in [city_pers, dist_pers] if p])
@@ -1512,8 +2283,12 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     out["برچسب‌ها"] = " | ".join(tags)
 
     # انتشار
-    out["created_at"] = ""
-    out["انتشار_تاریخ_شمسی"] = ""
+    schedule = _extract_publish_schedule_from_detail(sections)
+    published_shamsi = schedule.get("published") or ""
+    out["created_at"] = published_shamsi
+    out["انتشار_تاریخ_شمسی"] = published_shamsi
+    out["انتشار_آخرین_نردبان_شمسی"] = schedule.get("last_bumped") or ""
+    out["انتشار_آخرین_به‌روزرسانی_شمسی"] = schedule.get("last_updated") or ""
     out["انتشار_تاریخ_میلادی"] = ""
     out["انتشار_unavailable_after"] = safe_get(seo, ["unavailable_after"]) or ""
 
@@ -1559,6 +2334,10 @@ def _filter_by_advertiser_type(
     all | consultant | personal | genuine_personal
     — هم‌تراز منطق پلتفرم (advertiser_signal).
     """
+    from workspace.services.advertiser_signal_loader import ensure_advertiser_signal_importable
+
+    ensure_advertiser_signal_importable()
+
     from advertiser_signal import (
         normalize_filter_value,
         row_matches_advertiser_filter,
@@ -1585,84 +2364,67 @@ def _filter_by_advertiser_type(
     return filtered_rows
 
 
-_UNSUITABLE_RENT_PATTERNS = (
-    (
-        "همخانه",
-        re.compile(
-            r"هم[\s\-]?(?:خو?ن?ه|خانه)[\s\-]?[ای‌ی]?",
-            re.IGNORECASE | re.UNICODE,
-        ),
-    ),
-    (
-        "خوابگاه",
-        re.compile(
-            r"خواب[\s\-‌]?گاه[\s\-]?[ای‌ی]?",
-            re.IGNORECASE | re.UNICODE,
-        ),
-    ),
-    (
-        "پانسیون",
-        re.compile(
-            r"پانسیون[\s\-]?[ای‌ی]?",
-            re.IGNORECASE | re.UNICODE,
-        ),
-    ),
-)
-
-
-def _detect_unsuitable_rent_ad(combined_text: str) -> Optional[str]:
-    """برچسب نوع آگهی نامناسب برای فایلینگ مشاور؛ None یعنی نگه‌داشتن آگهی."""
-    for label, pattern in _UNSUITABLE_RENT_PATTERNS:
-        if pattern.search(combined_text):
-            return label
-    return None
-
-
 def _filter_roommate_ads(rows: List[Dict[str, Any]], return_removed: bool = False) -> tuple:
     """
-    فیلتر کردن آگهی‌های نامناسب اجاره از لیست داده‌ها
-    (همخانه، خوابگاه، پانسیون) — برای فایلینگ مشاوران مناسب نیستند.
-
+    فیلتر کردن آگهی‌های همخانه از لیست داده‌ها
+    این آگهی‌ها برای افرادی است که دنبال هم خانه هستند و برای فایلینگ مشاوران مناسب نیستند
+    
     Args:
         rows: لیست آگهی‌ها
         return_removed: اگر True باشد، لیست آگهی‌های حذف شده را هم برمی‌گرداند
-
+    
     Returns:
         اگر return_removed=False: لیست آگهی‌های فیلتر شده
-        اگر return_removed=True: (filtered_rows, removed_ads) که removed_ads لیستی از
-        (عنوان, نوع) است؛ مثلاً ("اتاق خوابگاهی", "خوابگاه")
+        اگر return_removed=True: (filtered_rows, removed_ads) که removed_ads لیستی از عنوان‌های حذف شده است
     """
+    # بررسی اینکه آیا این آگهی‌ها مربوط به اجاره هستند
     is_rent = False
     try:
         is_rent = "rent" in str(CONFIG.get("category", "")).lower()
     except Exception:
         is_rent = False
-
+    
+    # اگر اجاره نیست، نیازی به فیلتر نیست
     if not is_rent:
         if return_removed:
             return rows, []
         return rows
-
+    
+    # الگوی regex برای تشخیص کلمات کلیدی همخانه
+    # این الگو همه حالات مختلف را پوشش می‌دهد: همخانه، هم خانه، هم‌خانه، همخونه، هم خونه، هم‌خونه
+    # و همچنین حالات با پسوندهای مختلف: همخانه‌ای، هم‌خانه‌ی، و غیره
+    # الگو: هم (با یا بدون فاصله/خط تیره) + (خو?ن?ه یا خانه) + (اختیاری: ای/ی/‌)
+    roommate_pattern = re.compile(
+        r'هم[\s\-]?(?:خو?ن?ه|خانه)[\s\-]?[ای‌ی]?',
+        re.IGNORECASE | re.UNICODE
+    )
+    
     filtered_rows = []
     removed_ads = []
-
+    
     for row in rows:
+        # دریافت عنوان و توضیحات
         title = str(row.get("title", "") or row.get("عنوان", "") or "").strip()
         description = str(row.get("description", "") or row.get("توضیحات", "") or "").strip()
+        
+        # ترکیب عنوان و توضیحات برای جستجو
         combined_text = f"{title} {description}"
-
-        unsuitable_label = _detect_unsuitable_rent_ad(combined_text)
-        if unsuitable_label:
+        
+        # بررسی وجود کلمات کلیدی با استفاده از regex
+        if roommate_pattern.search(combined_text):
+            # این آگهی همخانه است، پس حذف می‌شود
             if return_removed:
+                # ذخیره عنوان برای گزارش
                 ad_title = title if title else "(بدون عنوان)"
-                removed_ads.append((ad_title, unsuitable_label))
+                removed_ads.append(ad_title)
             continue
-
+        
+        # اگر آگهی همخانه نبود، به لیست اضافه می‌شود
         filtered_rows.append(row)
-
+    
     if return_removed:
         return filtered_rows, removed_ads
-
+    
     return filtered_rows
 
 
@@ -1838,7 +2600,41 @@ def export_rows_to_records(
         result_df[col] = result_df[col].apply(
             lambda x: "-" if (x is None or (isinstance(x, str) and str(x).strip() == "")) else x
         )
-    return result_df.to_dict("records")
+    records = result_df.to_dict("records")
+    _schedule_meta_keys = (
+        "انتشار_تاریخ_شمسی",
+        "انتشار_آخرین_نردبان_شمسی",
+        "انتشار_آخرین_به‌روزرسانی_شمسی",
+    )
+    _money_meta_keys = (
+        "مالی_قیمت_کل_نمایش",
+        "مالی_قیمت_کل_عدد",
+        "مالی_قیمت_کل_وضعیت",
+        "مالی_قیمت_کل_برچسب",
+        "مالی_قیمت_هر_متر_نمایش",
+        "مالی_قیمت_هر_متر_عدد",
+        "مالی_قیمت_هر_متر_وضعیت",
+        "مالی_قیمت_هر_متر_برچسب",
+        "اجاره_ودیعه_نمایش",
+        "اجاره_ودیعه_عدد",
+        "اجاره_ودیعه_وضعیت",
+        "اجاره_ودیعه_برچسب",
+        "اجاره_ماهانه_نمایش",
+        "اجاره_ماهانه_عدد",
+        "اجاره_ماهانه_وضعیت",
+        "اجاره_ماهانه_برچسب",
+        "price_text",
+    )
+    for i, raw in enumerate(rows):
+        if i >= len(records):
+            break
+        for key in (*_schedule_meta_keys, *_money_meta_keys):
+            val = raw.get(key)
+            if val is None or val == "":
+                continue
+            records[i][key] = val
+    _merge_flatten_passthrough_into_records(records, rows)
+    return records
 
 
 def normalize_mixed_export_rows(rows: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
@@ -1985,23 +2781,7 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
 
     # Helper function برای استخراج عدد از رشته متراژ
     def extract_number_from_metraj(val):
-        """استخراج عدد از رشته متراژ (مثلاً "۲۴۴ متر" -> "۲۴۴")"""
-        if pd.isna(val) or val == "" or val is None or val == "-":
-            return "-"
-        val_str = str(val).strip()
-        if not val_str or val_str == "-":
-            return "-"
-
-        # حذف کلمه "متر" و فاصله‌ها
-        val_str = val_str.replace("متر", "").strip()
-
-        # استخراج اعداد (فارسی و انگلیسی)
-        numbers = re.findall(r'[\d۰-۹]+', val_str)
-        if numbers:
-            persian_to_english = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
-            number = numbers[0].translate(persian_to_english)
-            return number
-        return "-"
+        return format_metraj_export(val)
 
     # 1. شناسه
     result_df["شناسه"] = combine_excel_and_source("شناسه", "token")
@@ -2015,141 +2795,9 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
     # 4. شماره تماس (ستون خالی)
     result_df["شماره تماس"] = pd.Series(["-"] * len(df))
     
-    # 5. ایجاد آگهی
-    if "ایجاد آگهی" in df.columns:
-        # اگر ستون اکسل وجود دارد، از آن استفاده می‌کنیم
-        excel_col = get_col("ایجاد آگهی").copy()
-        # برای ردیف‌هایی که مقدار ندارند یا "-" هستند، از ستون اصلی استفاده می‌کنیم
-        if "انتشار_unavailable_after" in df.columns:
-            expiry_col = get_col("انتشار_unavailable_after")
-            try:
-                import jdatetime
-            except ImportError:
-                import subprocess
-                subprocess.check_call([sys.executable, "-m", "pip", "install", "jdatetime"])
-                import jdatetime
-            
-            def calc_created_from_expiry(val):
-                if pd.isna(val) or val == "" or val is None:
-                    return None
-                try:
-                    val_str = str(val).strip()
-                    formats = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]
-                    val_clean = val_str.split("+")[0].split("Z")[0]
-                    if "T" in val_clean:
-                        parts = val_clean.split("T")
-                        if len(parts) == 2:
-                            date_part = parts[0]
-                            time_part = parts[1].split(".")[0]
-                            val_clean = f"{date_part} {time_part}"
-                    
-                    dt = None
-                    for fmt in formats:
-                        try:
-                            dt = datetime.strptime(val_clean.strip(), fmt)
-                            break
-                        except:
-                            continue
-                    
-                    if dt:
-                        created_dt = dt - timedelta(days=30)
-                        jdt = jdatetime.datetime.fromgregorian(datetime=created_dt)
-                        return jdt.strftime("%Y/%m/%d %H:%M:%S")
-                except:
-                    pass
-                return None
-            
-            # برای ردیف‌هایی که مقدار ندارند یا "-" هستند، از ستون اصلی استفاده می‌کنیم
-            calculated_col = expiry_col.apply(calc_created_from_expiry)
-            excel_col = excel_col.fillna(calculated_col)
-            # همچنین مقادیر "-" را با مقادیر محاسبه شده جایگزین می‌کنیم
-            mask = (excel_col == "-") | (excel_col == "") | excel_col.isna()
-            excel_col[mask] = calculated_col[mask]
-            
-            result_df["ایجاد آگهی"] = excel_col
-        else:
-            result_df["ایجاد آگهی"] = excel_col
-    else:
-        # محاسبه از زیرعنوان یا انقضا
-        try:
-            import jdatetime
-        except ImportError:
-            import subprocess
-            subprocess.check_call([sys.executable, "-m", "pip", "install", "jdatetime"])
-            import jdatetime
-        
-        def convert_to_shamsi(val):
-            """تبدیل تاریخ میلادی به شمسی"""
-            if pd.isna(val) or val == "" or val is None:
-                return "-"
-            val_str = str(val).strip()
-            if not val_str or val_str == "-":
-                return "-"
-            try:
-                # تلاش برای پارس کردن تاریخ میلادی
-                formats = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
-                val_clean = val_str.split("+")[0].split("Z")[0]
-                if "T" in val_clean:
-                    parts = val_clean.split("T")
-                    if len(parts) == 2:
-                        date_part = parts[0]
-                        time_part = parts[1].split(".")[0]
-                        val_clean = f"{date_part} {time_part}"
-                
-                dt = None
-                for fmt in formats:
-                    try:
-                        dt = datetime.strptime(val_clean.strip(), fmt)
-                        break
-                    except:
-                        continue
-                
-                if dt:
-                    jdt = jdatetime.datetime.fromgregorian(datetime=dt)
-                    return jdt.strftime("%Y/%m/%d %H:%M:%S")
-                return val_str
-            except:
-                return val_str
-        
-        # ایجاد آگهی: از انقضا 30 روز کم می‌کنیم
-        expiry_col = get_col("انتشار_unavailable_after")
-        created_dates = []
-        if len(expiry_col) > 0 and expiry_col.notna().any():
-            for val in expiry_col:
-                if pd.isna(val) or val == "" or val is None:
-                    created_dates.append("-")
-                    continue
-                try:
-                    val_str = str(val).strip()
-                    formats = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]
-                    val_clean = val_str.split("+")[0].split("Z")[0]
-                    if "T" in val_clean:
-                        parts = val_clean.split("T")
-                        if len(parts) == 2:
-                            date_part = parts[0]
-                            time_part = parts[1].split(".")[0]
-                            val_clean = f"{date_part} {time_part}"
-                    
-                    dt = None
-                    for fmt in formats:
-                        try:
-                            dt = datetime.strptime(val_clean.strip(), fmt)
-                            break
-                        except:
-                            continue
-                    
-                    if dt:
-                        # 30 روز قبل از انقضا = تاریخ ایجاد
-                        created_dt = dt - timedelta(days=30)
-                        jdt = jdatetime.datetime.fromgregorian(datetime=created_dt)
-                        created_dates.append(jdt.strftime("%Y/%m/%d %H:%M:%S"))
-                    else:
-                        created_dates.append("-")
-                except:
-                    created_dates.append("-")
-        else:
-            created_dates = ["-"] * len(df)
-        result_df["ایجاد آگهی"] = created_dates
+    # 5. ایجاد آگهی (فقط تاریخ واقعی انتشار — بدون unavailable_after - 30)
+    _apply_created_shamsi_column(df, get_col, result_df, "ایجاد آگهی")
+    _optional_schedule_columns_from_df(df, get_col, result_df)
     
     # 6. انقضا آگهی
     if "انقضا آگهی" in df.columns:
@@ -2253,10 +2901,10 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
         else:
             result_df["انقضا آگهی"] = pd.Series(["-"] * len(df))
     
-    # 7. دسته‌بندی   
-    result_df["دسته‌بندی"] = combine_excel_and_source("دسته‌بندی", "دسته‌بندی_عنوان")
+    # 7–8. دسته‌بندی / آدرس / رسانه مشترک
+    _append_shared_listing_export_columns(result_df, df, get_col, combine_excel_and_source)
     
-    # 8. شهر
+    # 9. شهر
     if "شهر" in df.columns and "مکان_شهر" in df.columns:
         result_df["شهر"] = combine_excel_and_source("شهر", "مکان_شهر")
     elif "شهر" in df.columns:
@@ -2319,17 +2967,134 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
         else:
             metras = ["-"] * len(df)
         result_df["متراژ"] = pd.Series(metras)
-    
-    # 10.5. ساخت / اتاق / طبقه
-    result_df["ساخت"] = _extract_attribute_series(df, "ساخت")
-    result_df["اتاق"] = _extract_attribute_series(df, "اتاق")
-    result_df["طبقه"] = _extract_attribute_series(df, "طبقه", transform=normalize_floor_value)
+    if "متراژ" in result_df.columns:
+        result_df["متراژ"] = result_df["متراژ"].apply(extract_number_from_metraj)
+
+    def extract_from_attributes(attr_key, default="-"):
+        """استخراج مقدار از attributes بر اساس کلید."""
+        if "attributes" not in df.columns:
+            return pd.Series([default] * len(df))
+        results = []
+        for raw in df["attributes"].fillna(""):
+            val = default
+            try:
+                parts = [p.strip() for p in str(raw).split("|") if p.strip()]
+                for p in parts:
+                    if ":" in p:
+                        k, v = p.split(":", 1)
+                        if k.strip() == attr_key:
+                            val = v.strip()
+                            break
+            except Exception:
+                pass
+            results.append(val)
+        return pd.Series(results)
+
+    # 10b. ساخت
+    if "ساخت" in df.columns:
+        excel_col = get_col("ساخت").copy()
+        if "attributes" in df.columns:
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            if mask.any():
+                for idx in df.index[mask]:
+                    if pd.notna(df.loc[idx, "attributes"]) and str(df.loc[idx, "attributes"]).strip():
+                        val = "-"
+                        try:
+                            raw = str(df.loc[idx, "attributes"]).strip()
+                            parts = [p.strip() for p in raw.split("|") if p.strip()]
+                            for p in parts:
+                                if ":" in p:
+                                    k, v = p.split(":", 1)
+                                    if k.strip() == "ساخت":
+                                        val = v.strip()
+                                        break
+                        except Exception:
+                            pass
+                        if val != "-":
+                            excel_col.iloc[idx] = val
+        result_df["ساخت"] = excel_col
+    else:
+        result_df["ساخت"] = extract_from_attributes("ساخت", "-")
+
+    # 10c. اتاق
+    if "اتاق" in df.columns:
+        excel_col = get_col("اتاق").copy()
+        if "attributes" in df.columns:
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            if mask.any():
+                for idx in df.index[mask]:
+                    if pd.notna(df.loc[idx, "attributes"]) and str(df.loc[idx, "attributes"]).strip():
+                        val = "-"
+                        try:
+                            raw = str(df.loc[idx, "attributes"]).strip()
+                            parts = [p.strip() for p in raw.split("|") if p.strip()]
+                            for p in parts:
+                                if ":" in p:
+                                    k, v = p.split(":", 1)
+                                    if k.strip() == "اتاق":
+                                        val = v.strip()
+                                        break
+                        except Exception:
+                            pass
+                        if val != "-":
+                            excel_col.iloc[idx] = val
+        result_df["اتاق"] = excel_col
+    else:
+        result_df["اتاق"] = extract_from_attributes("اتاق", "-")
+
+    # 10d. طبقه
+    if "طبقه" in df.columns:
+        excel_col = get_col("طبقه").copy()
+        if "attributes" in df.columns:
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            if mask.any():
+                for idx in df.index[mask]:
+                    if pd.notna(df.loc[idx, "attributes"]) and str(df.loc[idx, "attributes"]).strip():
+                        val = "-"
+                        try:
+                            raw = str(df.loc[idx, "attributes"]).strip()
+                            parts = [p.strip() for p in raw.split("|") if p.strip()]
+                            for p in parts:
+                                if ":" in p:
+                                    k, v = p.split(":", 1)
+                                    if k.strip() == "طبقه":
+                                        val = v.strip()
+                                        break
+                        except Exception:
+                            pass
+                        if val != "-":
+                            excel_col.iloc[idx] = val
+        result_df["طبقه"] = excel_col
+    else:
+        result_df["طبقه"] = extract_from_attributes("طبقه", "-")
     
     # 11. قیمت
-    result_df["قیمت"] = combine_excel_and_source("قیمت", "مالی_قیمت_کل_عدد")
+    if "قیمت" in df.columns:
+        excel_col = get_col("قیمت").copy()
+        mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+        filled = _money_export_series(
+            df, get_col, "مالی_قیمت_کل_نمایش", "مالی_قیمت_کل_عدد", "مالی_قیمت_کل_وضعیت",
+        )
+        excel_col.loc[mask] = filled.loc[mask]
+        result_df["قیمت"] = excel_col
+    else:
+        result_df["قیمت"] = _money_export_series(
+            df, get_col, "مالی_قیمت_کل_نمایش", "مالی_قیمت_کل_عدد", "مالی_قیمت_کل_وضعیت",
+        )
     
     # 12. قیمت هر متر
-    result_df["قیمت هر متر"] = combine_excel_and_source("قیمت هر متر", "مالی_قیمت_هر_متر_عدد")
+    if "قیمت هر متر" in df.columns:
+        excel_col = get_col("قیمت هر متر").copy()
+        mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+        filled = _money_export_series(
+            df, get_col, "مالی_قیمت_هر_متر_نمایش", "مالی_قیمت_هر_متر_عدد", "مالی_قیمت_هر_متر_وضعیت",
+        )
+        excel_col.loc[mask] = filled.loc[mask]
+        result_df["قیمت هر متر"] = excel_col
+    else:
+        result_df["قیمت هر متر"] = _money_export_series(
+            df, get_col, "مالی_قیمت_هر_متر_نمایش", "مالی_قیمت_هر_متر_عدد", "مالی_قیمت_هر_متر_وضعیت",
+        )
     
     # 13. آسانسور
     result_df["آسانسور"] = combine_excel_and_source("آسانسور", "آسانسور", "-")
@@ -2340,14 +3105,45 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
     # 15. انباری
     result_df["انباری"] = combine_excel_and_source("انباری", "انباری", "-")
     
-    # 16. نوع آگهی دهنده — بر اساس سیگنال (مالک واقعی / مشاور پنهان / مشاور / شخصی)
-    from advertiser_signal import advertiser_display_label_for_row
-
-    signal_labels = [
-        advertiser_display_label_for_row(df.iloc[i].to_dict()) or "-"
-        for i in range(len(df))
-    ]
-    result_df["نوع آگهی دهنده"] = pd.Series(signal_labels, index=df.index)
+    # 16. نوع آگهی دهنده
+    if "نوع آگهی دهنده" in df.columns:
+        excel_col = get_col("نوع آگهی دهنده").copy()
+        # برای ردیف‌هایی که مقدار ندارند، از ستون اصلی استفاده می‌کنیم
+        source_col_name = "فروشنده_business_type" if "فروشنده_business_type" in df.columns else "business_type"
+        if source_col_name in df.columns:
+            source_col = get_col(source_col_name)
+            def convert_business_type(x):
+                if pd.isna(x) or x == "" or x is None:
+                    return "-"
+                x_str = str(x).strip().lower()
+                if x_str == "personal":
+                    return "شخصی"
+                elif x_str == "business":
+                    return "بنگاه"
+                elif x_str == "premium-panel":
+                    return "مشاور"
+                else:
+                    return x if x else "-"
+            converted_col = source_col.apply(convert_business_type)
+            # پر کردن مقادیر خالی از ستون اصلی
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            excel_col[mask] = converted_col[mask]
+        result_df["نوع آگهی دهنده"] = excel_col
+    else:
+        business_type = get_col("فروشنده_business_type") if "فروشنده_business_type" in df.columns else get_col("business_type")
+        def convert_business_type(x):
+            if pd.isna(x) or x == "" or x is None:
+                return "-"
+            x_str = str(x).strip().lower()
+            if x_str == "personal":
+                return "شخصی"
+            elif x_str == "business":
+                return "بنگاه"
+            elif x_str == "premium-panel":
+                return "مشاور"
+            else:
+                return x if x else "-"
+        result_df["نوع آگهی دهنده"] = business_type.apply(convert_business_type)
 
     # 16b. اطلاعات مشاور / آژانس (از API lazy)
     result_df["نام مشاور / آژانس"] = combine_excel_and_source("نام مشاور / آژانس", "مشاور_نام")
@@ -2391,10 +3187,7 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
     # 21. تعداد تصاویر
     result_df["تعداد تصاویر"] = combine_excel_and_source("تعداد تصاویر", "رسانه_تعداد_تصویر")
     
-    # 22. اصالت تصویر
-    result_df["اصالت تصویر"] = combine_excel_and_source("اصالت تصویر", "رسانه_اصالت_تصویر_برای_همین_ملک")
-    
-    # 23. ویدیو دارد؟
+    # 22. ویدیو دارد؟
     if "ویدیو دارد؟" in df.columns:
         excel_col = get_col("ویدیو دارد؟").copy()
         if "رسانه_ویدیو" in df.columns:
@@ -2417,16 +3210,14 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
     else:
         result_df["توضیحات"] = get_col("توضیحات") if "توضیحات" in df.columns else get_col("description")
     
-    # 26. تصویر نقشه
-    result_df["تصویر نقشه"] = combine_excel_and_source("تصویر نقشه", "نقشه_تصویر")
-
-    # 27–28. لینک تصاویر (در انتهای فایل)
+    # 26–27. لینک تصاویر (در انتهای فایل)
     _append_image_link_excel_columns(result_df, df, combine_excel_and_source)
     
     # ترتیب ستون‌ها — ویژگی‌های تفکیک‌شده بعد از امکانات پایه
     sell_column_order = [
-        "شناسه", "عنوان", "لینک", "شماره تماس", "ایجاد آگهی", "انقضا آگهی",
-        "دسته‌بندی", "شهر", "محله", "متراژ", "ساخت", "اتاق", "طبقه",
+        "شناسه", "عنوان", "لینک", "شماره تماس",
+        *SHARED_SCHEDULE_EXPORT_COLUMNS,
+        "دسته‌بندی", "شهر", "محله", "آدرس", "متراژ", "ساخت", "اتاق", "طبقه",
         "قیمت", "قیمت هر متر",
         "آسانسور", "پارکینگ", "انباری",
         *FEATURE_EXCEL_COLUMNS,
@@ -2604,9 +3395,7 @@ def _export_to_excel_sell(df: Any, output_path: str, export_columns: Optional[Li
             is_personal = False
             if business_type_col_idx:
                 business_type_cell = ws.cell(row=row_idx, column=business_type_col_idx)
-                if str(business_type_cell.value or "").strip() in (
-                    "شخصی", "مالک واقعی", "مشاور پنهان",
-                ):
+                if business_type_cell.value == "شخصی":
                     is_personal = True
             
             for col_idx in range(1, ws.max_column + 1):
@@ -2690,24 +3479,7 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
     
     # Helper function برای استخراج عدد از رشته متراژ
     def extract_number_from_metraj(val):
-        """استخراج عدد از رشته متراژ (مثلاً "۲۴۴ متر" -> "۲۴۴")"""
-        if pd.isna(val) or val == "" or val is None or val == "-":
-            return "-"
-        val_str = str(val).strip()
-        if not val_str or val_str == "-":
-            return "-"
-        
-        # حذف کلمه "متر" و فاصله‌ها
-        val_str = val_str.replace("متر", "").strip()
-        
-        # استخراج اعداد (فارسی و انگلیسی)
-        numbers = re.findall(r'[\d۰-۹]+', val_str)
-        if numbers:
-            # تبدیل اعداد فارسی به انگلیسی
-            persian_to_english = str.maketrans('۰۱۲۳۴۵۶۷۸۹', '0123456789')
-            number = numbers[0].translate(persian_to_english)
-            return number
-        return "-"
+        return format_metraj_export(val)
     
     # Helper function برای بررسی اینکه آیا مقدار عددی خالص است
     def is_pure_numeric(val):
@@ -2736,10 +3508,16 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
     
     # Helper function برای استخراج عدد از رشته قیمت (فقط برای مقادیر رشته‌ای)
     def extract_number_from_price(val):
-        """استخراج عدد از رشته قیمت (مثلاً "۱،۲۰۰،۰۰۰،۰۰۰ تومان" -> "1200000000")
-        اگر مقدار عددی خالص باشد، بدون تغییر برمی‌گرداند."""
+        """استخراج عدد یا برچسب متنی قیمت برای ستون‌های ودیعه/اجاره."""
         if pd.isna(val) or val == "" or val is None or val == "-":
             return "-"
+        money = parse_divar_money_display(val)
+        if money.get("status") in _MONEY_STATUS_LABELS:
+            return _MONEY_STATUS_LABELS[money["status"]]
+        if money.get("status") == "zero":
+            return 0
+        if money.get("status") == "numeric" and money.get("amount") is not None:
+            return money["amount"]
         
         # اگر مقدار عددی خالص است، آن را به رشته تبدیل می‌کنیم و برمی‌گردانیم
         if is_pure_numeric(val):
@@ -2839,8 +3617,8 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
     else:
         result_df["محله"] = get_col("مکان_منطقه") if "مکان_منطقه" in df.columns else get_col("district_persian")
     
-    # 5. آدرس
-    result_df["آدرس"] = combine_excel_and_source("آدرس", "مکان_آدرس", "-")
+    # 5. دسته‌بندی / آدرس / رسانه مشترک
+    _append_shared_listing_export_columns(result_df, df, get_col, combine_excel_and_source)
     
     # 6. متراژ
     if "متراژ" in df.columns:
@@ -2863,61 +3641,128 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
         result_df["متراژ"] = extract_from_attributes("متراژ", "-").apply(extract_number_from_metraj)
     
     # 7. ساخت
-    result_df["ساخت"] = _extract_attribute_series(df, "ساخت")
+    if "ساخت" in df.columns:
+        excel_col = get_col("ساخت").copy()
+        # فقط برای ردیف‌هایی که مقدار ندارند و attributes دارند، از attributes استفاده می‌کنیم
+        if "attributes" in df.columns:
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            if mask.any():
+                # فقط برای ردیف‌هایی که attributes دارند و مقدار ندارند
+                for idx in df.index[mask]:
+                    if pd.notna(df.loc[idx, "attributes"]) and str(df.loc[idx, "attributes"]).strip():
+                        val = "-"
+                        try:
+                            raw = str(df.loc[idx, "attributes"]).strip()
+                            parts = [p.strip() for p in raw.split("|") if p.strip()]
+                            for p in parts:
+                                if ":" in p:
+                                    k, v = p.split(":", 1)
+                                    if k.strip() == "ساخت":
+                                        val = v.strip()
+                                        break
+                        except:
+                            pass
+                        if val != "-":
+                            excel_col.iloc[idx] = val
+        result_df["ساخت"] = excel_col
+    else:
+        result_df["ساخت"] = extract_from_attributes("ساخت", "-")
     
     # 8. اتاق
-    result_df["اتاق"] = _extract_attribute_series(df, "اتاق")
+    if "اتاق" in df.columns:
+        excel_col = get_col("اتاق").copy()
+        # فقط برای ردیف‌هایی که مقدار ندارند و attributes دارند، از attributes استفاده می‌کنیم
+        if "attributes" in df.columns:
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            if mask.any():
+                # فقط برای ردیف‌هایی که attributes دارند و مقدار ندارند
+                for idx in df.index[mask]:
+                    if pd.notna(df.loc[idx, "attributes"]) and str(df.loc[idx, "attributes"]).strip():
+                        val = "-"
+                        try:
+                            raw = str(df.loc[idx, "attributes"]).strip()
+                            parts = [p.strip() for p in raw.split("|") if p.strip()]
+                            for p in parts:
+                                if ":" in p:
+                                    k, v = p.split(":", 1)
+                                    if k.strip() == "اتاق":
+                                        val = v.strip()
+                                        break
+                        except:
+                            pass
+                        if val != "-":
+                            excel_col.iloc[idx] = val
+        result_df["اتاق"] = excel_col
+    else:
+        result_df["اتاق"] = extract_from_attributes("اتاق", "-")
     
     # 9. طبقه
-    result_df["طبقه"] = _extract_attribute_series(df, "طبقه", transform=normalize_floor_value)
+    if "طبقه" in df.columns:
+        excel_col = get_col("طبقه").copy()
+        # فقط برای ردیف‌هایی که مقدار ندارند و attributes دارند، از attributes استفاده می‌کنیم
+        if "attributes" in df.columns:
+            mask = excel_col.isna() | (excel_col == "") | (excel_col == "-")
+            if mask.any():
+                # فقط برای ردیف‌هایی که attributes دارند و مقدار ندارند
+                for idx in df.index[mask]:
+                    if pd.notna(df.loc[idx, "attributes"]) and str(df.loc[idx, "attributes"]).strip():
+                        val = "-"
+                        try:
+                            raw = str(df.loc[idx, "attributes"]).strip()
+                            parts = [p.strip() for p in raw.split("|") if p.strip()]
+                            for p in parts:
+                                if ":" in p:
+                                    k, v = p.split(":", 1)
+                                    if k.strip() == "طبقه":
+                                        val = v.strip()
+                                        break
+                        except:
+                            pass
+                        if val != "-":
+                            excel_col.iloc[idx] = val
+        result_df["طبقه"] = excel_col
+    else:
+        result_df["طبقه"] = extract_from_attributes("طبقه", "-")
     
     # 10. ودیعه
     if "ودیعه" in df.columns:
         excel_col = get_col("ودیعه").copy()
-        # فقط روی مقادیر خالی یا "-" پردازش انجام می‌شود
-        # مقادیر موجود که عددی خالص هستند، بدون تغییر نگه داشته می‌شوند
         mask_empty = excel_col.isna() | (excel_col == "") | (excel_col == "-")
-        # برای مقادیر غیر خالی که رشته‌ای با فرمت خاص هستند، پردازش انجام می‌شود
+        filled = _money_export_series(
+            df, get_col, "اجاره_ودیعه_نمایش", "اجاره_ودیعه_عدد", "اجاره_ودیعه_وضعیت",
+        )
+        excel_col.loc[mask_empty] = filled.loc[mask_empty]
         mask_to_process = ~mask_empty
         if mask_to_process.any():
             for idx in df.index[mask_to_process]:
                 val = excel_col.iloc[idx]
-                # فقط اگر مقدار عددی خالص نیست، پردازش می‌شود
                 if not is_pure_numeric(val):
-                    processed_val = extract_number_from_price(val)
-                    excel_col.iloc[idx] = processed_val
-        
-        # برای مقادیر خالی، از ستون منبع استفاده می‌کنیم
-        if "اجاره_ودیعه_عدد" in df.columns:
-            source_col = get_col("اجاره_ودیعه_عدد")
-            excel_col[mask_empty] = source_col[mask_empty]
+                    excel_col.iloc[idx] = extract_number_from_price(val)
         result_df["ودیعه"] = excel_col
     else:
-        result_df["ودیعه"] = get_col("اجاره_ودیعه_عدد", "-")
+        result_df["ودیعه"] = _money_export_series(
+            df, get_col, "اجاره_ودیعه_نمایش", "اجاره_ودیعه_عدد", "اجاره_ودیعه_وضعیت",
+        )
     
     # 11. اجاره ماهانه
     if "اجاره ماهانه" in df.columns:
         excel_col = get_col("اجاره ماهانه").copy()
-        # فقط روی مقادیر خالی یا "-" پردازش انجام می‌شود
-        # مقادیر موجود که عددی خالص هستند، بدون تغییر نگه داشته می‌شوند
         mask_empty = excel_col.isna() | (excel_col == "") | (excel_col == "-")
-        # برای مقادیر غیر خالی که رشته‌ای با فرمت خاص هستند، پردازش انجام می‌شود
+        filled = _money_export_series(
+            df, get_col, "اجاره_ماهانه_نمایش", "اجاره_ماهانه_عدد", "اجاره_ماهانه_وضعیت",
+        )
+        excel_col.loc[mask_empty] = filled.loc[mask_empty]
         mask_to_process = ~mask_empty
         if mask_to_process.any():
             for idx in df.index[mask_to_process]:
                 val = excel_col.iloc[idx]
-                # فقط اگر مقدار عددی خالص نیست، پردازش می‌شود
                 if not is_pure_numeric(val):
-                    processed_val = extract_number_from_price(val)
-                    excel_col.iloc[idx] = processed_val
-        
-        # برای مقادیر خالی، از ستون منبع استفاده می‌کنیم
-        if "اجاره_ماهانه_عدد" in df.columns:
-            source_col = get_col("اجاره_ماهانه_عدد")
-            excel_col[mask_empty] = source_col[mask_empty]
+                    excel_col.iloc[idx] = extract_number_from_price(val)
         result_df["اجاره ماهانه"] = excel_col
     else:
-        result_df["اجاره ماهانه"] = get_col("اجاره_ماهانه_عدد", "-")
+        result_df["اجاره ماهانه"] = _money_export_series(
+            df, get_col, "اجاره_ماهانه_نمایش", "اجاره_ماهانه_عدد", "اجاره_ماهانه_وضعیت",
+        )
     
     # 12. ودیعه و اجاره (قابل تبدیل/غیر قابل تبدیل)
     if "ودیعه و اجاره" in df.columns:
@@ -3001,134 +3846,9 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
         video_col = get_col("رسانه_ویدیو")
         result_df["ویدیو دارد؟"] = video_col.apply(lambda x: "دارد" if x and str(x).strip() else "ندارد")
     
-    # 24. ایجاد آگهی (محاسبه از انقضا - 30 روز)
-    try:
-        import jdatetime
-    except ImportError:
-        import subprocess
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "jdatetime"])
-        import jdatetime
-    
-    if "ایجاد آگهی" in df.columns:
-        # اگر ستون اکسل وجود دارد، از آن استفاده می‌کنیم
-        excel_col = get_col("ایجاد آگهی").copy()
-        # برای ردیف‌هایی که مقدار ندارند یا "-" هستند، از ستون اصلی استفاده می‌کنیم
-        if "انتشار_unavailable_after" in df.columns:
-            expiry_col = get_col("انتشار_unavailable_after")
-            
-            def calc_created_from_expiry(val):
-                if pd.isna(val) or val == "" or val is None:
-                    return None
-                try:
-                    val_str = str(val).strip()
-                    formats = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]
-                    val_clean = val_str.split("+")[0].split("Z")[0]
-                    if "T" in val_clean:
-                        parts = val_clean.split("T")
-                        if len(parts) == 2:
-                            date_part = parts[0]
-                            time_part = parts[1].split(".")[0]
-                            val_clean = f"{date_part} {time_part}"
-                    
-                    dt = None
-                    for fmt in formats:
-                        try:
-                            dt = datetime.strptime(val_clean.strip(), fmt)
-                            break
-                        except:
-                            continue
-                    
-                    if dt:
-                        created_dt = dt - timedelta(days=30)
-                        jdt = jdatetime.datetime.fromgregorian(datetime=created_dt)
-                        return jdt.strftime("%Y/%m/%d %H:%M:%S")
-                except:
-                    pass
-                return None
-            
-            # برای ردیف‌هایی که مقدار ندارند یا "-" هستند، از ستون اصلی استفاده می‌کنیم
-            calculated_col = expiry_col.apply(calc_created_from_expiry)
-            excel_col = excel_col.fillna(calculated_col)
-            # همچنین مقادیر "-" را با مقادیر محاسبه شده جایگزین می‌کنیم
-            mask = (excel_col == "-") | (excel_col == "") | excel_col.isna()
-            excel_col[mask] = calculated_col[mask]
-            
-            result_df["ایجاد آگهی"] = excel_col
-        else:
-            result_df["ایجاد آگهی"] = excel_col
-    else:
-        # محاسبه از انقضا
-        def convert_to_shamsi(val):
-            """تبدیل تاریخ میلادی به شمسی"""
-            if pd.isna(val) or val == "" or val is None:
-                return "-"
-            val_str = str(val).strip()
-            if not val_str or val_str == "-":
-                return "-"
-            try:
-                formats = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d"]
-                val_clean = val_str.split("+")[0].split("Z")[0]
-                if "T" in val_clean:
-                    parts = val_clean.split("T")
-                    if len(parts) == 2:
-                        date_part = parts[0]
-                        time_part = parts[1].split(".")[0]
-                        val_clean = f"{date_part} {time_part}"
-                
-                dt = None
-                for fmt in formats:
-                    try:
-                        dt = datetime.strptime(val_clean.strip(), fmt)
-                        break
-                    except:
-                        continue
-                
-                if dt:
-                    jdt = jdatetime.datetime.fromgregorian(datetime=dt)
-                    return jdt.strftime("%Y/%m/%d %H:%M:%S")
-                return val_str
-            except:
-                return val_str
-        
-        # ایجاد آگهی: از انقضا 30 روز کم می‌کنیم
-        expiry_col = get_col("انتشار_unavailable_after")
-        created_dates = []
-        if len(expiry_col) > 0 and expiry_col.notna().any():
-            for val in expiry_col:
-                if pd.isna(val) or val == "" or val is None:
-                    created_dates.append("-")
-                    continue
-                try:
-                    val_str = str(val).strip()
-                    formats = ["%Y-%m-%dT%H:%M:%S.%f", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"]
-                    val_clean = val_str.split("+")[0].split("Z")[0]
-                    if "T" in val_clean:
-                        parts = val_clean.split("T")
-                        if len(parts) == 2:
-                            date_part = parts[0]
-                            time_part = parts[1].split(".")[0]
-                            val_clean = f"{date_part} {time_part}"
-                    
-                    dt = None
-                    for fmt in formats:
-                        try:
-                            dt = datetime.strptime(val_clean.strip(), fmt)
-                            break
-                        except:
-                            continue
-                    
-                    if dt:
-                        # 30 روز قبل از انقضا = تاریخ ایجاد
-                        created_dt = dt - timedelta(days=30)
-                        jdt = jdatetime.datetime.fromgregorian(datetime=created_dt)
-                        created_dates.append(jdt.strftime("%Y/%m/%d %H:%M:%S"))
-                    else:
-                        created_dates.append("-")
-                except:
-                    created_dates.append("-")
-        else:
-            created_dates = ["-"] * len(df)
-        result_df["ایجاد آگهی"] = created_dates
+    # 24. ایجاد آگهی (فقط تاریخ واقعی انتشار)
+    _apply_created_shamsi_column(df, get_col, result_df, "ایجاد آگهی")
+    _optional_schedule_columns_from_df(df, get_col, result_df)
     
     # 25. انقضا آگهی
     if "انقضا آگهی" in df.columns:
@@ -3292,16 +4012,16 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
     
     # تنظیم ترتیب ستون‌ها
     column_order = [
-        "شناسه", "عنوان", "لینک", "نوع آگهی دهنده",
-        "نام مشاور / آژانس", "آگهی‌های فعال مشاور",
-        "شهر", "محله", "آدرس", "متراژ", "ساخت", "اتاق", "طبقه",
+        "شناسه", "عنوان", "لینک", "شماره تماس",
+        *SHARED_SCHEDULE_EXPORT_COLUMNS,
+        "دسته‌بندی", "شهر", "محله", "آدرس", "متراژ", "ساخت", "اتاق", "طبقه",
         "آسانسور", "پارکینگ", "انباری",
         *FEATURE_EXCEL_COLUMNS,
         "ودیعه", "اجاره ماهانه", "ودیعه و اجاره",
-        "ایجاد آگهی", "انقضا آگهی", "شماره تماس",
-        "تعداد تصاویر", "ویدیو دارد؟",
-        "عرض جغرافیایی", "طول جغرافیایی", "در شعاع (متر)", "نوع مختصات",
-        "ویژگی‌ها و امکانات", "توضیحات",
+        "نوع آگهی دهنده", "نام مشاور / آژانس", "آگهی‌های فعال مشاور",
+        "عرض جغرافیایی", "طول جغرافیایی", "نوع مختصات", "در شعاع (متر)",
+        "تعداد تصاویر", "اصالت تصویر", "ویدیو دارد؟",
+        "ویژگی‌ها و امکانات", "توضیحات", "تصویر نقشه",
         *IMAGE_LINK_EXCEL_COLUMNS,
     ]
     
@@ -3471,9 +4191,7 @@ def _export_to_excel_rent(df: Any, output_path: str, export_columns: Optional[Li
             is_personal = False
             if business_type_col_idx:
                 business_type_cell = ws.cell(row=row_idx, column=business_type_col_idx)
-                if str(business_type_cell.value or "").strip() in (
-                    "شخصی", "مالک واقعی", "مشاور پنهان",
-                ):
+                if business_type_cell.value == "شخصی":
                     is_personal = True
             
             for col_idx in range(1, ws.max_column + 1):
