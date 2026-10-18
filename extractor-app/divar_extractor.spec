@@ -116,6 +116,7 @@ a = Analysis(
         "pystray",
         "pystray._win32",
         "export_divar_items",
+        "advertiser_signal",
         "license_core",
         "requests",
         "urllib3",

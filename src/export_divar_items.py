@@ -2324,6 +2324,26 @@ def flatten_post_detail(detail: Dict[str, Any]) -> Dict[str, Any]:
     return out
 
 
+def _ensure_advertiser_signal_importable() -> None:
+    """
+    ماژول advertiser_signal را در محیط standalone (Windows EXE) importable می‌کند.
+
+    در Django از workspace.services.advertiser_signal_loader استفاده می‌شود؛
+    این تابع فقط برای مسیر اکسترکتور/ویندوز است.
+    """
+    from pathlib import Path
+
+    anchor = Path(__file__).resolve().parent
+    if (anchor / "advertiser_signal.py").is_file():
+        path = str(anchor)
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        return
+    raise ModuleNotFoundError(
+        "advertiser_signal not found; expected advertiser_signal.py alongside export_divar_items.py",
+    )
+
+
 def _filter_by_advertiser_type(
     rows: List[Dict[str, Any]],
     advertiser_filter: str = "all",
@@ -2334,9 +2354,7 @@ def _filter_by_advertiser_type(
     all | consultant | personal | genuine_personal
     — هم‌تراز منطق پلتفرم (advertiser_signal).
     """
-    from workspace.services.advertiser_signal_loader import ensure_advertiser_signal_importable
-
-    ensure_advertiser_signal_importable()
+    _ensure_advertiser_signal_importable()
 
     from advertiser_signal import (
         normalize_filter_value,
