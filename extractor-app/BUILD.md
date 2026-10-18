@@ -97,3 +97,18 @@ release/
 - `inno\setup.iss` — تنظیمات نصب‌کننده (منبع اصلی)
 - `inno\docs\` — LICENSE و INFO_BEFORE مخصوص اپ استخراج
 - `prepare_release.bat` — همگام‌سازی `release` با `dist`
+
+## ساخت در GitHub Actions
+
+برای ساخت بدون نصب محلی Python/Inno روی CI:
+
+1. در GitHub به ریپازیتوری `Divarfiling-Windowsapp` بروید.
+2. تب **Actions** → Workflow **Build Windows EXE & Inno Setup**.
+3. **Run workflow** → شاخه `main` → **Run workflow**.
+4. پس از اتمام Run سبز، در همان Run بخش **Artifacts** را باز کنید:
+   - **DivarFiling-Windows-EXE** — `DivarFilingExtractor.exe` (قابل اجرا بدون نصب) + `build-manifest.txt`
+   - **DivarFiling-Windows-Setup** — `DivarFilingExtractor_Setup_<version>.exe` (نصب‌کننده برای کاربران) + manifest
+5. نسخه خروجی از `app\ui\tokens.py` (`APP_VERSION`) و `inno\setup.iss` (`MyAppVersion`) گرفته می‌شود؛ هر دو باید یکسان باشند.
+6. در صورت خطا، لاگ Stepهای **Build EXE** و **Build installer** را ببینید؛ manifest شامل SHA256 و SHA commit است.
+
+فایل YAML: `.github/workflows/build-windows.yml` (Runner: `windows-2022`, Python 3.11).

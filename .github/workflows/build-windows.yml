@@ -1,0 +1,148 @@
+name: Build Windows EXE & Inno Setup
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-windows-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: PyInstaller + Inno Setup
+    runs-on: windows-2022
+    timeout-minutes: 45
+
+    defaults:
+      run:
+        shell: cmd
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: extractor-app/requirements-build.txt
+
+      - name: Install build dependencies
+        working-directory: extractor-app
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements-build.txt
+
+      - name: Verify core imports
+        working-directory: extractor-app
+        run: |
+          python -c "import customtkinter, requests, pandas, openpyxl, numpy, PIL, jdatetime, winotify, pystray, keyring; import PyInstaller; print('imports ok')"
+          python -m PyInstaller --version
+
+      - name: Install Inno Setup 6
+        shell: pwsh
+        run: |
+          $paths = @(
+            "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe",
+            "${env:ProgramFiles}\Inno Setup 6\ISCC.exe",
+            "$env:LOCALAPPDATA\Programs\Inno Setup 6\ISCC.exe"
+          )
+          if (-not ($paths | Where-Object { Test-Path $_ })) {
+            choco install innosetup -y --no-progress
+          }
+          $iscc = $paths | Where-Object { Test-Path $_ } | Select-Object -First 1
+          if (-not $iscc) { throw "ISCC.exe not found after Inno Setup install" }
+          & $iscc /?
+          "INNO_SETUP=$iscc" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build EXE (PyInstaller)
+        working-directory: extractor-app
+        run: call build_exe.bat nopause
+
+      - name: Build installer (Inno Setup)
+        working-directory: extractor-app
+        run: call build_installer.bat nopause
+
+      - name: Read application version
+        id: appver
+        shell: pwsh
+        run: |
+          $match = Select-String -Path extractor-app/app/ui/tokens.py -Pattern 'APP_VERSION = "([^"]+)"' | Select-Object -First 1
+          if (-not $match) { throw "APP_VERSION not found in tokens.py" }
+          $version = $match.Matches.Groups[1].Value
+          "version=$version" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Validate outputs and write manifest
+        id: manifest
+        shell: pwsh
+        run: |
+          $version = "${{ steps.appver.outputs.version }}"
+          $exe = "extractor-app/dist/DivarFilingExtractor.exe"
+          $setupDir = "extractor-app/release/installer-out"
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          $setup = Get-ChildItem -Path $setupDir -Filter "DivarFilingExtractor_Setup_*.exe" -ErrorAction Stop | Select-Object -First 1
+          if (-not $setup) { throw "Missing installer in $setupDir" }
+          if ($setup.Name -notlike "*$version*") {
+            throw "Installer name $($setup.Name) does not match APP_VERSION $version"
+          }
+
+          $exeHash = (Get-FileHash $exe -Algorithm SHA256).Hash
+          $setupHash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash
+          $manifestPath = "extractor-app/release/installer-out/build-manifest.txt"
+          @(
+            "repository=${{ github.repository }}"
+            "ref=${{ github.ref }}"
+            "commit=${{ github.sha }}"
+            "workflow_run=${{ github.run_id }}"
+            "app_version=$version"
+            "exe_path=$exe"
+            "exe_bytes=$((Get-Item $exe).Length)"
+            "exe_sha256=$exeHash"
+            "setup_path=$($setup.FullName)"
+            "setup_bytes=$($setup.Length)"
+            "setup_sha256=$setupHash"
+            "pyinstaller=$((python -m PyInstaller --version 2>&1 | Out-String).Trim())"
+            "python=$((python --version 2>&1 | Out-String).Trim())"
+          ) | Set-Content -Path $manifestPath -Encoding UTF8
+
+          "exe_path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "setup_path=$($setup.FullName)" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+          "manifest_path=$manifestPath" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Silent install smoke test
+        shell: pwsh
+        run: |
+          $setup = Get-Item "${{ steps.manifest.outputs.setup_path }}"
+          $target = Join-Path $env:RUNNER_TEMP "DivarFilingExtractor-ci"
+          if (Test-Path $target) { Remove-Item $target -Recurse -Force }
+          $proc = Start-Process -FilePath $setup.FullName -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$target") -PassThru -Wait
+          if ($proc.ExitCode -ne 0) { throw "Silent install failed with exit code $($proc.ExitCode)" }
+          $installedExe = Join-Path $target "DivarFilingExtractor.exe"
+          if (-not (Test-Path $installedExe)) { throw "Installed exe not found at $installedExe" }
+
+      - name: Upload portable EXE artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DivarFiling-Windows-EXE
+          path: |
+            extractor-app/dist/DivarFilingExtractor.exe
+            extractor-app/release/installer-out/build-manifest.txt
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload Inno Setup installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: DivarFiling-Windows-Setup
+          path: |
+            extractor-app/release/installer-out/DivarFilingExtractor_Setup_*.exe
+            extractor-app/release/installer-out/build-manifest.txt
+          retention-days: 30
+          if-no-files-found: error
