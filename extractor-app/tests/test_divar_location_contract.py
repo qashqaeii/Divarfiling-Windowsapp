@@ -130,6 +130,7 @@ def _headline_detail(title: str, city: str, district: str = '') -> dict:
             'آهنگران (سراسیاب دولاب)',
         ),
         ('۱ ساعت پیش در تهران، المهدی، خ سلمان فارسی', 'تهران', 'المهدی', 'خ سلمان فارسی', None),
+        ('۲ هفته پیش در گرگان، ک نیایش چهارم', 'گرگان', '', 'ک نیایش چهارم', None),
     ],
 )
 def test_real_divar_ads_windows_contract(title, city, district, expected_street, expected_nb):
@@ -159,3 +160,12 @@ def test_shiraz_neighborhood_not_street():
     assert loc['neighborhood'] == 'معالی‌آباد'
     assert loc['street'] == 'بلوار شاهد'
     assert row.get('مکان_خیابان') == 'بلوار شاهد'
+
+
+def test_export_rows_sets_technical_key_from_display():
+    raw = flatten_post_detail(_headline_detail(
+        '۲ هفته پیش در گرگان، ک نیایش چهارم', 'گرگان', '',
+    ))
+    records = export_rows_to_records([raw], category='apartment-rent')
+    assert records[0].get('خیابان') == 'ک نیایش چهارم'
+    assert records[0].get('مکان_خیابان') == 'ک نیایش چهارم'
