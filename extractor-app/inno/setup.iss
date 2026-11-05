@@ -7,7 +7,7 @@
 
 #define MyAppNameEn      "Divar Filing Extractor"
 #define MyAppNameFa      "ربات استخراج فایلینگ دیوار"
-#define MyAppVersion     "2.15.0"
+#define MyAppVersion     "2.15.1"
 #define MyAppPublisher   "divarfiling.ir"
 #define MyAppURL         "https://divarfiling.ir/"
 #define MyAppSupportURL  "https://divarfiling.ir/"

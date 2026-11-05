@@ -22,7 +22,7 @@ build_all.bat
 | فایل | مسیر |
 |------|------|
 | exe تک‌فایلی | `dist\DivarFilingExtractor.exe` |
-| نصب‌کننده | `release\installer-out\DivarFilingExtractor_Setup_2.15.0.exe` |
+| نصب‌کننده | `release\installer-out\DivarFilingExtractor_Setup_2.15.1.exe` |
 
 ## ساخت مرحله‌به‌مرحله
 
