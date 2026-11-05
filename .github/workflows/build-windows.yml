@@ -44,7 +44,12 @@ jobs:
         working-directory: extractor-app
         run: |
           python -c "import customtkinter, requests, pandas, openpyxl, numpy, PIL, jdatetime, winotify, pystray, keyring; import PyInstaller; print('imports ok')"
+          python -c "import numpy, pandas; print('numpy', numpy.__version__); print('pandas', pandas.__version__)"
           python -m PyInstaller --version
+
+      - name: Self-test (Python source)
+        working-directory: extractor-app
+        run: python main.py --self-test-imports
 
       - name: Install Inno Setup 6
         shell: pwsh
@@ -69,6 +74,15 @@ jobs:
       - name: Build EXE (PyInstaller)
         working-directory: extractor-app
         run: call build_exe.bat nopause
+
+      - name: Self-test portable EXE imports
+        working-directory: extractor-app
+        shell: pwsh
+        run: |
+          $exe = Join-Path (Get-Location) "dist/DivarFilingExtractor.exe"
+          if (-not (Test-Path $exe)) { throw "Missing $exe" }
+          & $exe --self-test-imports
+          if ($LASTEXITCODE -ne 0) { throw "self-test-imports failed on portable EXE (exit $LASTEXITCODE)" }
 
       - name: Build installer (Inno Setup)
         working-directory: extractor-app
@@ -114,6 +128,8 @@ jobs:
             "setup_sha256=$setupHash"
             "pyinstaller=$((python -m PyInstaller --version 2>&1 | Out-String).Trim())"
             "python=$((python --version 2>&1 | Out-String).Trim())"
+            "numpy=$((python -c \"import numpy; print(numpy.__version__)\" 2>&1 | Out-String).Trim())"
+            "pandas=$((python -c \"import pandas; print(pandas.__version__)\" 2>&1 | Out-String).Trim())"
           ) | Set-Content -Path $manifestPath -Encoding UTF8
 
           "exe_path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -130,6 +146,8 @@ jobs:
           if ($proc.ExitCode -ne 0) { throw "Silent install failed with exit code $($proc.ExitCode)" }
           $installedExe = Join-Path $target "DivarFilingExtractor.exe"
           if (-not (Test-Path $installedExe)) { throw "Installed exe not found at $installedExe" }
+          & $installedExe --self-test-imports
+          if ($LASTEXITCODE -ne 0) { throw "self-test-imports failed on installed EXE (exit $LASTEXITCODE)" }
 
       - name: Upload portable EXE artifact
         uses: actions/upload-artifact@v4

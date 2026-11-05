@@ -18,7 +18,17 @@ else:
 
 os.chdir(APP_ROOT)
 
-from app.gui import run_app
+
+def _run_self_test_imports() -> int:
+    from app.self_test_imports import run_self_test_imports
+
+    return run_self_test_imports()
+
 
 if __name__ == "__main__":
+    if "--self-test-imports" in sys.argv:
+        raise SystemExit(_run_self_test_imports())
+
+    from app.gui import run_app
+
     run_app()

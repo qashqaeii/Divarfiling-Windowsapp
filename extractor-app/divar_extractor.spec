@@ -5,8 +5,53 @@
 import os
 
 import customtkinter
+from PyInstaller.utils.hooks import collect_all
 
 block_cipher = None
+
+_RUNTIME_DLL_BASENAMES = frozenset(
+    {
+        "msvcp140.dll",
+        "vcruntime140.dll",
+        "vcruntime140_1.dll",
+    }
+)
+
+
+def _normalize_path(path: str) -> str:
+    return path.replace("/", "\\").lower()
+
+
+def _merge_collected_binaries(*groups: list) -> list:
+    """Prefer numpy.libs over pandas.libs for duplicate DLL basenames; skip bundled VC runtimes from pandas window."""
+    by_base: dict[str, tuple] = {}
+    order: list[str] = []
+    for entry in groups:
+        for item in entry:
+            dest, src = item[0], item[1]
+            base = os.path.basename(dest).lower()
+            src_norm = _normalize_path(src)
+            if "pandas\\_libs\\window" in src_norm and base in _RUNTIME_DLL_BASENAMES:
+                continue
+            prev = by_base.get(base)
+            if prev is None:
+                by_base[base] = item
+                order.append(base)
+                continue
+            prev_src = _normalize_path(prev[1])
+            new_src = src_norm
+            if "numpy.libs" in new_src and "numpy.libs" not in prev_src:
+                by_base[base] = item
+            elif "pandas.libs" in prev_src and "numpy.libs" in new_src:
+                by_base[base] = item
+    return [by_base[b] for b in order]
+
+
+_numpy = collect_all("numpy")
+_pandas = collect_all("pandas")
+_extra_binaries = _merge_collected_binaries(_numpy[1], _pandas[1])
+_extra_datas = _numpy[0] + _pandas[0]
+_extra_hidden = _numpy[2] + _pandas[2]
 
 # SPECPATH = پوشه حاوی این فایل (extractor-app)
 EXTRACTOR_ROOT = SPECPATH
@@ -69,10 +114,12 @@ a = Analysis(
         ext_path("app"),
         repo_path("src"),
     ],
-    binaries=[],
-    datas=datas_list,
-    hiddenimports=[
+    binaries=_extra_binaries,
+    datas=datas_list + _extra_datas,
+    hiddenimports=_extra_hidden
+    + [
         "app",
+        "app.self_test_imports",
         "app.brand",
         "app.constants",
         "app.extraction_engine",
@@ -211,7 +258,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     runtime_tmpdir=None,
     console=False,
