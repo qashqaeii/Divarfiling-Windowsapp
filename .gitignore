@@ -10,7 +10,8 @@ __pycache__/
 venv/
 
 # Build / release artifacts
-extractor-app/build/
+extractor-app/build/*
+!extractor-app/build/version_info.txt
 extractor-app/dist/
 extractor-app/release/app/
 extractor-app/release/installer-out/
