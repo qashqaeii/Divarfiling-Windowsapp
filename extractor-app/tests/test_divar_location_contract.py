@@ -169,3 +169,33 @@ def test_export_rows_sets_technical_key_from_display():
     records = export_rows_to_records([raw], category='apartment-rent')
     assert records[0].get('خیابان') == 'ک نیایش چهارم'
     assert records[0].get('مکان_خیابان') == 'ک نیایش چهارم'
+
+
+@pytest.mark.parametrize(
+    'title,city,district,expected_city,expected_neighborhood,expected_street',
+    [
+        ('هفته پیش در آبادان، بلوار بهارستان', 'آبادان', '', 'آبادان', None, 'بلوار بهارستان'),
+        ('۷ ساعت پیش در آبادان، خ ولایت ۴', 'آبادان', '', 'آبادان', None, 'خ ولایت ۴'),
+        ('۲ هفته پیش در آبادان، خ یکم', 'آبادان', '', 'آبادان', None, 'خ یکم'),
+        ('۲ ساعت پیش در آبادان، خ تخت جمشید ۱ شرقی', 'آبادان', '', 'آبادان', None, 'خ تخت جمشید ۱ شرقی'),
+        ('۱۱ ساعت پیش در آبادان، خ مهرآباد چهارم شرقی', 'آبادان', '', 'آبادان', None, 'خ مهرآباد چهارم شرقی'),
+        ('۲ ساعت پیش در آبادان، کوی فرهنگیان', 'آبادان', '', 'آبادان', None, 'کوی فرهنگیان'),
+        ('نیم ساعت پیش در گرگان، خ صیاد بیست و ششم', 'گرگان', '', 'گرگان', None, 'خ صیاد بیست و ششم'),
+        ('هفته پیش در تهران، مطهری، خ روحی', 'تهران', '', 'تهران', 'مطهری', 'خ روحی'),
+        ('لحظاتی پیش در تهران، جیحون، خ دامپزشکی', 'تهران', '', 'تهران', 'جیحون', 'خ دامپزشکی'),
+        ('دقایقی پیش در تهران، مسعودیه، خ فلسطین شرقی', 'تهران', '', 'تهران', 'مسعودیه', 'خ فلسطین شرقی'),
+        ('دقایقی پیش در تهران، شهرآرا، خ اکبریان آذر', 'تهران', '', 'تهران', 'شهرآرا', 'خ اکبریان آذر'),
+    ],
+)
+def test_title_line_street_vs_neighborhood_contract(
+    title, city, district, expected_city, expected_neighborhood, expected_street,
+):
+    detail = _headline_detail(title, city, district)
+    loc = extract_post_location(detail)
+    row = flatten_post_detail(detail)
+    assert loc['city'] == expected_city
+    assert loc.get('neighborhood') == expected_neighborhood
+    assert loc['street'] == expected_street
+    assert row.get('مکان_خیابان') == expected_street
+    if expected_neighborhood:
+        assert row.get('مکان_محله') == expected_neighborhood
