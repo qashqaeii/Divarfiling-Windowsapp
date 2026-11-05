@@ -19,15 +19,24 @@ else:
 os.chdir(APP_ROOT)
 
 
-def _run_self_test_imports() -> int:
+def _parse_self_test_log(argv: list[str]) -> str | None:
+    for index, arg in enumerate(argv):
+        if arg == "--self-test-log" and index + 1 < len(argv):
+            return argv[index + 1]
+        if arg.startswith("--self-test-log="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _run_self_test_imports(log_path: str | None = None) -> int:
     from app.self_test_imports import run_self_test_imports
 
-    return run_self_test_imports()
+    return run_self_test_imports(log_path=log_path)
 
 
 if __name__ == "__main__":
     if "--self-test-imports" in sys.argv:
-        raise SystemExit(_run_self_test_imports())
+        raise SystemExit(_run_self_test_imports(_parse_self_test_log(sys.argv)))
 
     from app.gui import run_app
 

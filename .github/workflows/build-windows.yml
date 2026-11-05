@@ -79,10 +79,35 @@ jobs:
         working-directory: extractor-app
         shell: pwsh
         run: |
+          function Invoke-FrozenExeSelfTest {
+            param(
+              [Parameter(Mandatory = $true)][string]$ExePath,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+            if (-not (Test-Path $ExePath)) {
+              throw "Missing EXE: $ExePath"
+            }
+            $logPath = Join-Path $env:RUNNER_TEMP "$Label-self-test-imports.log"
+            if (Test-Path $logPath) { Remove-Item $logPath -Force }
+            $proc = Start-Process `
+              -FilePath $ExePath `
+              -ArgumentList @("--self-test-imports", "--self-test-log=$logPath") `
+              -Wait `
+              -PassThru
+            $exitCode = $proc.ExitCode
+            Write-Host "=== $Label EXE self-test (exit $exitCode) ==="
+            if (Test-Path $logPath) {
+              Get-Content -Path $logPath -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "WARNING: self-test log not found at $logPath"
+            }
+            if ($null -eq $exitCode -or $exitCode -ne 0) {
+              throw "$Label EXE self-test failed (exit code: $exitCode)"
+            }
+          }
+
           $exe = Join-Path (Get-Location) "dist/DivarFilingExtractor.exe"
-          if (-not (Test-Path $exe)) { throw "Missing $exe" }
-          & $exe --self-test-imports
-          if ($LASTEXITCODE -ne 0) { throw "self-test-imports failed on portable EXE (exit $LASTEXITCODE)" }
+          Invoke-FrozenExeSelfTest -ExePath $exe -Label "portable"
 
       - name: Build installer (Inno Setup)
         working-directory: extractor-app
@@ -114,6 +139,10 @@ jobs:
           $exeHash = (Get-FileHash $exe -Algorithm SHA256).Hash
           $setupHash = (Get-FileHash $setup.FullName -Algorithm SHA256).Hash
           $manifestPath = "extractor-app/release/installer-out/build-manifest.txt"
+          $pyinstallerVer = (python -m PyInstaller --version 2>&1 | Out-String).Trim()
+          $pythonVer = (python --version 2>&1 | Out-String).Trim()
+          $numpyVer = (python -c 'import numpy; print(numpy.__version__)' 2>&1 | Out-String).Trim()
+          $pandasVer = (python -c 'import pandas; print(pandas.__version__)' 2>&1 | Out-String).Trim()
           @(
             "repository=${{ github.repository }}"
             "ref=${{ github.ref }}"
@@ -126,10 +155,10 @@ jobs:
             "setup_path=$($setup.FullName)"
             "setup_bytes=$($setup.Length)"
             "setup_sha256=$setupHash"
-            "pyinstaller=$((python -m PyInstaller --version 2>&1 | Out-String).Trim())"
-            "python=$((python --version 2>&1 | Out-String).Trim())"
-            "numpy=$((python -c \"import numpy; print(numpy.__version__)\" 2>&1 | Out-String).Trim())"
-            "pandas=$((python -c \"import pandas; print(pandas.__version__)\" 2>&1 | Out-String).Trim())"
+            "pyinstaller=$pyinstallerVer"
+            "python=$pythonVer"
+            "numpy=$numpyVer"
+            "pandas=$pandasVer"
           ) | Set-Content -Path $manifestPath -Encoding UTF8
 
           "exe_path=$exe" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
@@ -139,15 +168,40 @@ jobs:
       - name: Silent install smoke test
         shell: pwsh
         run: |
+          function Invoke-FrozenExeSelfTest {
+            param(
+              [Parameter(Mandatory = $true)][string]$ExePath,
+              [Parameter(Mandatory = $true)][string]$Label
+            )
+            if (-not (Test-Path $ExePath)) {
+              throw "Missing EXE: $ExePath"
+            }
+            $logPath = Join-Path $env:RUNNER_TEMP "$Label-self-test-imports.log"
+            if (Test-Path $logPath) { Remove-Item $logPath -Force }
+            $proc = Start-Process `
+              -FilePath $ExePath `
+              -ArgumentList @("--self-test-imports", "--self-test-log=$logPath") `
+              -Wait `
+              -PassThru
+            $exitCode = $proc.ExitCode
+            Write-Host "=== $Label EXE self-test (exit $exitCode) ==="
+            if (Test-Path $logPath) {
+              Get-Content -Path $logPath -Encoding UTF8 | ForEach-Object { Write-Host $_ }
+            } else {
+              Write-Host "WARNING: self-test log not found at $logPath"
+            }
+            if ($null -eq $exitCode -or $exitCode -ne 0) {
+              throw "$Label EXE self-test failed (exit code: $exitCode)"
+            }
+          }
+
           $setup = Get-Item "${{ steps.manifest.outputs.setup_path }}"
           $target = Join-Path $env:RUNNER_TEMP "DivarFilingExtractor-ci"
           if (Test-Path $target) { Remove-Item $target -Recurse -Force }
           $proc = Start-Process -FilePath $setup.FullName -ArgumentList @("/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART", "/DIR=$target") -PassThru -Wait
           if ($proc.ExitCode -ne 0) { throw "Silent install failed with exit code $($proc.ExitCode)" }
           $installedExe = Join-Path $target "DivarFilingExtractor.exe"
-          if (-not (Test-Path $installedExe)) { throw "Installed exe not found at $installedExe" }
-          & $installedExe --self-test-imports
-          if ($LASTEXITCODE -ne 0) { throw "self-test-imports failed on installed EXE (exit $LASTEXITCODE)" }
+          Invoke-FrozenExeSelfTest -ExePath $installedExe -Label "installed"
 
       - name: Upload portable EXE artifact
         uses: actions/upload-artifact@v4

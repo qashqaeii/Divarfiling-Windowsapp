@@ -4,6 +4,7 @@ Used in CI and for diagnosing DLL / PyInstaller packaging issues.
 """
 from __future__ import annotations
 
+import os
 import sys
 import traceback
 
@@ -106,25 +107,47 @@ _IMPORT_CHECKS: list[str] = [
 ]
 
 
-def run_self_test_imports() -> int:
+def run_self_test_imports(log_path: str | None = None) -> int:
     """Return 0 on success, 1 on any import failure."""
     _ensure_console_on_frozen_windows()
-    print("Divar Filing Extractor — self-test-imports")
-    print(f"Python: {sys.version.split()[0]}")
-    print(f"Frozen: {getattr(sys, 'frozen', False)}")
-    print("---")
-    failed = False
-    for label in _IMPORT_CHECKS:
-        try:
-            ver = _run_check(label)
-            print(f"OK  {label}  ({ver})")
-        except Exception as exc:
-            failed = True
-            print(f"FAIL  {label}: {exc}")
-            traceback.print_exc()
-    print("---")
-    if failed:
-        print("self-test-imports: FAILED")
-        return 1
-    print("self-test-imports: PASSED")
-    return 0
+
+    log_file = None
+    if log_path:
+        log_dir = os.path.dirname(os.path.abspath(log_path))
+        if log_dir:
+            os.makedirs(log_dir, exist_ok=True)
+        log_file = open(log_path, "w", encoding="utf-8", errors="replace")  # noqa: SIM115
+
+    def emit(line: str = "") -> None:
+        print(line, flush=True)
+        if log_file is not None:
+            log_file.write(line + "\n")
+            log_file.flush()
+
+    try:
+        emit("Divar Filing Extractor — self-test-imports")
+        emit(f"Python: {sys.version.split()[0]}")
+        emit(f"Frozen: {getattr(sys, 'frozen', False)}")
+        if log_path:
+            emit(f"Log: {os.path.abspath(log_path)}")
+        emit("---")
+        failed = False
+        for label in _IMPORT_CHECKS:
+            try:
+                ver = _run_check(label)
+                emit(f"OK  {label}  ({ver})")
+            except Exception as exc:
+                failed = True
+                emit(f"FAIL  {label}: {exc}")
+                tb = traceback.format_exc()
+                for tb_line in tb.rstrip().splitlines():
+                    emit(tb_line)
+        emit("---")
+        if failed:
+            emit("self-test-imports: FAILED")
+            return 1
+        emit("self-test-imports: PASSED")
+        return 0
+    finally:
+        if log_file is not None:
+            log_file.close()
